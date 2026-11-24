@@ -159,7 +159,7 @@ fn on() -> bool {
 fn decide() -> bool {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let started = Config::from_env().is_some_and(start);
+        let started = Config::from_env().is_some_and(start_sampler);
         let state = if started { ON } else { OFF };
         STATE.store(state, Relaxed);
     });
@@ -212,6 +212,13 @@ pub(crate) fn frame() {
     if on() {
         FRAMES.fetch_add(1, Relaxed);
     }
+}
+
+/// Starts the profiler now if `VICTORY_PROFILE` asks for it, rather than at
+/// the first call that watches a thread: called once, when the first meter
+/// is made, so a run that never submits is profiled too.
+pub(crate) fn start() {
+    let _ = on();
 }
 
 // ---------------------------------------------------------------------
@@ -2887,7 +2894,7 @@ impl Pace {
 }
 
 /// Starts the sampler; false if its thread could not be made.
-fn start(config: Config) -> bool {
+fn start_sampler(config: Config) -> bool {
     use std::os::windows::io::IntoRawHandle;
     let says = format!(
         "profiling (VICTORY_PROFILE=1): {} looks a second at the submitting, recording and worker \
