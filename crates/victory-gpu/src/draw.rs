@@ -277,9 +277,6 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
-    /// One of this draw's views names the exposure image
-    /// (`VICTORY_EXPOSURE_SCALE`), for [`State::bind`] to scale before it.
-    reads_image: std::cell::Cell<bool>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -1027,9 +1024,6 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
-        // Cleared for every bind: `readable` raises it, and `bind` scales the
-        // exposure image before this draw if any of its views reads it.
-        self.reads_image.set(false);
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1291,58 +1285,7 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
-        // `VICTORY_EXPOSURE_SCALE`, at the reader: the exposure image is
-        // scaled here, before this draw's own commands, so the draw samples
-        // the scaled value.
-        self.scale_for_reader(list, p, compute);
         true
-    }
-
-    /// Scales the exposure image just before a program whose views read it,
-    /// and never in a program that writes it (`VICTORY_EXPOSURE_SCALE`).
-    ///
-    /// The pass leaves its own descriptor heap and pipeline bound: the
-    /// title's go back as this bind had set them. A graphics draw only — a
-    /// dispatch would also lose the compute root signature, its constants
-    /// and its tables, and rebuilding those is not worth a lever whose
-    /// reader is a draw.
-    fn scale_for_reader(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
-        if !self.reads_image.replace(false) {
-            return;
-        }
-        let writes = p.stages.iter().any(|s| s.shader.writes_exposure);
-        if !writes
-            && !compute
-            && !crate::exposure::scaled_this_frame()
-            && crate::exposure::scale_image(list)
-        {
-            // SAFETY: an open list; the heaps and the pipeline this bind set.
-            unsafe {
-                let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                    .heaps
-                    .iter()
-                    .filter(|&&h| h != 0)
-                    .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                    .map(|h| Some(h.heap.clone()))
-                    .collect();
-                list.list.SetDescriptorHeaps(&heaps);
-                list.list.SetPipelineState(&p.pso);
-            }
-            self.host_heaps = self.heaps;
-            self.host_pipeline = p.pso.as_raw() as usize;
-            // The pass set its own compute root signature: the tracked one
-            // is stale, and a compute bind that found it equal would skip
-            // setting it (the graphics one, `[0]`, is untouched).
-            self.host_roots[1] = 0;
-        }
-        // `VICTORY_EXPOSURE_READERS`: who reads, and on which side of the
-        // pass this draw found it.
-        crate::exposure::log_reader(
-            &p.name,
-            compute,
-            crate::exposure::scaled_this_frame(),
-            writes,
-        );
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -2119,7 +2062,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                self.readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2833,7 +2776,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            self.readable(list, u.kind, &view);
+            readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2958,7 +2901,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        self.readable(list, u.kind, &view);
+                        readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -2969,7 +2912,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        self.readable(list, kind, &view);
+                        readable(list, kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -3007,7 +2950,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            self.readable(list, kind, &view);
+                            readable(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3139,44 +3082,36 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
-        if ran {
-            // The program that wrote it names the image the lever scales and
-            // the reader scan looks for (`crate::exposure`).
-            self.note_exposure_image();
+        if ran && self.exposure(list) {
+            // The pass bound its own heap, root signature and pipeline:
+            // the next draw or dispatch binds the title's again.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
         }
     }
 
-    /// Keeps the exposure image for the lever, when the draw's program is one
-    /// that writes it. Nothing at all with the lever's variables unset.
-    fn note_exposure_image(&self) {
-        if crate::exposure::scale().is_none() && !crate::exposure::readers() {
-            return;
+    /// After a draw: the exposure it wrote is scaled by
+    /// `VICTORY_EXPOSURE_SCALE` ([`crate::exposure`]), if its program is one
+    /// of those that write the exposure. Whether anything was recorded.
+    fn exposure(&self, list: &HostList) -> bool {
+        if crate::exposure::scale().is_none() {
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return;
+            return false;
         };
         if !p.stages.iter().any(|s| s.shader.writes_exposure) {
-            return;
+            return false;
         }
         // The exposure programs draw a three-vertex triangle over a 1x1
         // viewport into the only 1x1 f2 target there is; a draw under such a
         // program into anything else is not the exposure, and is left alone.
         let mut targets = self.targets.iter().filter(|&&t| t != 0);
         let (Some(&target), None) = (targets.next(), targets.next()) else {
-            return;
+            return false;
         };
-        crate::exposure::note_image(target as This);
-    }
-
-    /// What a view needs, and — with `VICTORY_EXPOSURE_SCALE` or
-    /// `VICTORY_EXPOSURE_READERS` — whether it names the exposure image,
-    /// which [`State::bind`] scales before the draw that reads it
-    /// ([`crate::exposure`]).
-    fn readable(&self, list: &HostList, kind: ResourceType, view: &View) {
-        readable(list, kind, view);
-        if crate::exposure::names_image(view) {
-            self.reads_image.set(true);
-        }
+        crate::exposure::after_draw(list, target as This)
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
