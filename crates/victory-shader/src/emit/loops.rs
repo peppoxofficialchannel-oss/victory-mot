@@ -170,13 +170,15 @@ impl Lower<'_> {
         // loop cut at 64 it ran 90 frames. Raised to those again on
         // 2026-11-25, after the fixes of loops that ran long for other reasons
         // (helper lanes, fixed counts, exchanges in loops), the opening
-        // cutscene lost the card again 9 minutes in, and loop notes named
-        // loops still without an end: PS_Textured_Eight's search of its
-        // shadow cascades, whose count it reads as 0 (b37565055f2f7d3b,
-        // 1af4a50c7fb40c97: 10,441 pixels at 1,024), and the projected-decal
-        // resolve's walk of its decal bits (c4183d3cbee28e8e, in the
-        // approximate one-host-wave form: 10,381 lanes at 65,536). Raise them
-        // once those end.)
+        // cutscene ran 9 minutes, until Windows reset the card as a
+        // remote-desktop session ended (Parsec; no work of ours). Loop notes
+        // found no loop that needs more than these limits, only loops
+        // without an end, which a higher limit only runs longer:
+        // PS_Textured_Eight's search of its shadow cascades, whose count it
+        // reads as 0 (b37565055f2f7d3b, 1af4a50c7fb40c97: 10,441 pixels at
+        // 1,024), and the projected-decal resolve's walk of its decal bits
+        // (c4183d3cbee28e8e, in the approximate one-host-wave form: 10,381
+        // lanes at 65,536). Raise them once those end.)
         let limits = super::super::loop_limits();
         let limit = if self.s.pixel {
             limits.pixel
