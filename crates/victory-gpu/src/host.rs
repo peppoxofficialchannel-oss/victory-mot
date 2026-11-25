@@ -439,6 +439,22 @@ fn io_back(total: u64, issue: u64, wait: u64) {
         ms(IO_RELAY[0].swap(0, Ordering::Relaxed)),
         ms(IO_RELAY[1].swap(0, Ordering::Relaxed)),
     );
+    // `relay-hand` sums every reason a submission settles; which one it is
+    // decides the cure, so the same cadence prints them apart. `LATE_WAITED`
+    // is only ever added to, so taking it here costs nothing elsewhere.
+    let waited = |why: usize| LATE_WAITED[why].swap(0, Ordering::Relaxed) as f64 / 1e3;
+    tracing::info!(
+        "late waits (VICTORY_IO_TIMING): sync={:.1} card-done={:.1} value={:.1} stale={:.1} read={:.1} run={:.1} most={:.1} writes={:.1} fence={:.1} ms",
+        waited(WHY_SYNC),
+        waited(WHY_CARD_DONE),
+        waited(WHY_VALUE),
+        waited(WHY_STALE),
+        waited(WHY_READ),
+        waited(WHY_RUN),
+        waited(WHY_MOST),
+        waited(WHY_WRITES),
+        waited(WHY_FENCE),
+    );
 }
 
 /// `VICTORY_IO_TIMING`'s sums since the last line: issue, wait, total (µs).
