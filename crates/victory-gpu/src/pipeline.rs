@@ -333,6 +333,30 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: false,
 });
 
+/// The builder runs whole and is not turned off ([`Builder`]): read at
+/// every dispatch of a program that walks the structures
+/// ([`structures_walked`]), without the builder's lock.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the programs that walk the title's ray-tracing structures may
+/// read their nodes: the structure builder runs ([`Builder`]). While it
+/// does not (before its first dispatch, with `VICTORY_BVH_BUILDER=0`, or
+/// once turned off), every node test of theirs answers no hit without
+/// reading memory (`victory_shader::emit::USER_STRUCTURES`): no box is
+/// entered and no triangle hit, so their rays see an empty scene instead
+/// of whatever bytes lie where the structures would be (see
+/// [`walk_held`]; in wave 2's runs with the builder off, screen-aligned
+/// dark tiles on sunlit hair and lit squares in shadow, and the hair's
+/// light changing from run to run). `VICTORY_BVH_NO_HIT=0` lets them walk
+/// those bytes, as before.
+#[cfg(windows)]
+pub(crate) fn structures_walked() -> bool {
+    static ANYWAY: OnceLock<bool> = OnceLock::new();
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+        || *ANYWAY.get_or_init(|| std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "0"))
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -456,6 +480,7 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
 }
@@ -490,6 +515,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
