@@ -2163,18 +2163,20 @@ impl State {
         }
         if builder {
             crate::bvhtrace::arm();
-            // What a stage reads from list upload memory (the process heap,
-            // past the title's 40 bits), as it stands when the list is
-            // submitted: the builder fills it after recording.
+            // What a stage reads from list upload memory (`crate::list::upload`,
+            // or the heap past it), as it stands when the list is submitted:
+            // the builder fills it after recording.
             let hash = p.stages.first().map_or(String::new(), |s| s.shader.hash.clone());
             let headers = crate::bvhtrace::header_stage() == Some(hash.as_str());
             let count = self.compute.iter().find_map(|r| match r {
                 Root::Constants(v) => v.first().copied(),
                 _ => None,
             });
+            let upload = crate::list::upload::span();
+            let in_upload = |a: u64| a >= 1 << 40 || upload.is_some_and(|(start, len)| (start..start + len).contains(&a));
             for root in &self.compute {
                 if let Root::View(a) = *root
-                    && a >= 1 << 40
+                    && in_upload(a)
                 {
                     let hash = hash.clone();
                     list.defer_host(move || {
