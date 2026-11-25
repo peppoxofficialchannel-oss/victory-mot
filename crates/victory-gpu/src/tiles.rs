@@ -42,6 +42,17 @@
 //!   the title lets go of, or that turns out to be the next texture's,
 //!   keeps its tiles; it is hidden by the views and written with zeros at
 //!   the next upload. Its tiles go back when the host copy does.
+//! - With the card past its line (`resource.rs` `room`) no held level got
+//!   tiles at all, so a texture streamed in while the card was full showed
+//!   nothing (its view was as the title made it, and read zeros) until room
+//!   came. The levels the card packs together are the *smallest* ones, the
+//!   first the title holds, and one tile: with `VICTORY_LEVELS_WHEN_FULL=1`
+//!   they are given even then, out of the tiles the pool has free (no heap
+//!   is made), so the surface shows them — blurred, at the lowest level
+//!   that made it in — instead of no texture at all. The larger levels wait
+//!   for room as before. Unlike an unconditional mip skip, this only
+//!   degrades what the card cannot hold at that moment: with room, the
+//!   levels the title holds are given in full.
 //!
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
@@ -68,8 +79,26 @@ const HEAP_TILES: u32 = 1024;
 /// the pool's heaps; such textures made in all; levels given; calls of
 /// `UpdateTileMappings`; their microseconds; heaps given back to the card;
 /// uploads that left a held level without tiles (the card had no room, or
-/// no heap could be had); uploads recorded again for such a level.
-pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// no heap could be had); uploads recorded again for such a level; uploads
+/// with no room in which the packed levels were given anyway
+/// ([`small_when_full`]); and uploads with no room of a texture that showed
+/// no level before the call (those that go from no level at all to one
+/// when the switch is on, and that count what the switch would save).
+pub(crate) static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+
+/// Whether the levels the card packs together — the smallest, the first the
+/// title holds — are given even with no room on the card, out of the pool's
+/// free tiles: `VICTORY_LEVELS_WHEN_FULL=1` (off by default).
+///
+/// Without it, a texture streamed in while the card is past its line gets
+/// no tiles at all and shows nothing until room comes; with it, it shows
+/// the small levels it has (blurred) at the cost of a tile of 64 KiB each.
+/// Only tiles the pool already has free are used: no heap is made while the
+/// card has no room, so the pool cannot grow this way.
+pub(crate) fn small_when_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_WHEN_FULL").is_some_and(|v| v == "1"))
+}
 
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
@@ -192,7 +221,24 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             }
         }
     };
-    let h = pool[index].as_mut()?;
+    carve(&mut pool, index, count)
+}
+
+/// [`take`] with no heap made: `count` tiles of the one heap that has that
+/// many free, `None` when none has. For levels given while the card has no
+/// room, where the pool must not grow.
+fn take_existing(count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+    if count == 0 || count > HEAP_TILES {
+        return None;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let index = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count))?;
+    carve(&mut pool, index, count)
+}
+
+/// [`take`]'s tail: `count` tiles out of the heap at `index` in the pool.
+fn carve(pool: &mut Vec<Option<Heap>>, index: usize, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+    let h = pool.get_mut(index)?.as_mut()?;
     let mut runs = Vec::new();
     let mut left = count;
     while left > 0 {
@@ -376,11 +422,41 @@ impl Tiled {
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
+        let before = self.shown.load(Ordering::Relaxed);
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let (may, fresh) = if room {
+            (named, true)
+        } else if small_when_full() {
+            // Only the levels the card packs together (the smallest, the
+            // first the title holds), and only out of the tiles the pool
+            // has free: the surface shows those, blurred, instead of
+            // nothing.
+            (card | self.packed_levels(held), false)
+        } else {
+            (card, true)
+        };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may, fresh);
+        if !room {
+            if before == u32::MAX && self.shown.load(Ordering::Relaxed) != u32::MAX {
+                STATS[11].fetch_add(1, Ordering::Relaxed);
+            }
+            if before == u32::MAX {
+                STATS[12].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
+    }
+
+    /// Of `named`, the levels the card packs into shared tiles together
+    /// (those from the first packed level on), if any of them is named.
+    fn packed_levels(&self, named: u32) -> u32 {
+        let first_packed = self.standard.len() as u32;
+        if self.packed == 0 || first_packed >= 32 {
+            return 0;
+        }
+        named & !((1u32 << first_packed) - 1)
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -415,6 +491,7 @@ impl Tiled {
             texture,
             prev | levels | self.held.load(Ordering::Relaxed),
             levels,
+            true,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
@@ -487,10 +564,11 @@ impl Tiled {
     /// the levels the card packs together get theirs when any of them is
     /// so named. `named`: the levels that are the title's or the card's
     /// own, by which the first level a view may show is told; `may`: the
-    /// ones of them that may get tiles in this call. To be called only
-    /// from a submission-time step of a list that writes every level of
-    /// `may`, whole: the call is ahead of that list on `queue`, and tiles
-    /// hold what their last owner left.
+    /// ones of them that may get tiles in this call; `fresh`: a heap of the
+    /// pool may be made for them (it may not while the card has no room,
+    /// [`take_existing`]). To be called only from a submission-time step of
+    /// a list that writes every level of `may`, whole: the call is ahead of
+    /// that list on `queue`, and tiles hold what their last owner left.
     /// Returns whether the first level a view may show changed
     /// ([`Tiled::first_shown`]): the caller has the texture's slots made
     /// again.
@@ -504,7 +582,7 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, true)
     }
 
     fn give_locked(
@@ -515,22 +593,30 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        fresh: bool,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
+        // The packed levels first, when only they may be given: they are the
+        // cheapest, and with no room the pool's last free tiles must not go
+        // to a large level.
+        if !fresh && self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
+            wanted.push((first_packed, self.packed, None));
+        }
         for level in 0..first_packed {
             if !given.levels[level as usize] && now(level) {
                 wanted.push((level, self.standard[level as usize], Some(level as usize)));
             }
         }
-        if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
+        if fresh && self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
             wanted.push((first_packed, self.packed, None));
         }
         for (subresource, tiles, level) in wanted {
-            let Some((heap, index, runs)) = take(device, tiles) else {
+            let taken = if fresh { take(device, tiles) } else { take_existing(tiles) };
+            let Some((heap, index, runs)) = taken else {
                 continue;
             };
             let at = D3D12_TILED_RESOURCE_COORDINATE {
@@ -697,7 +783,9 @@ pub(crate) fn status() {
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
          UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
+         level without memory (no room on the card, or no heap), {} uploads were recorded again for one; \
+         of the uploads with no room, {} showed no level at all before it and {} were given the packed \
+         levels anyway (VICTORY_LEVELS_WHEN_FULL=1)",
         s[0],
         s[4],
         s[2] >> 20,
@@ -712,6 +800,8 @@ pub(crate) fn status() {
         s[7],
         s[9],
         s[10],
+        s[12],
+        s[11],
     );
 }
 
@@ -1478,6 +1568,18 @@ void look() {
         assert_eq!(parse_floor(Some("2048")), 2048 << 10);
         assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
         assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    /// With no room on the card the levels that fit are given out of the
+    /// pool's free tiles and no heap is made for them ([`take_existing`]):
+    /// a request no heap can serve gives nothing and leaves the pool's
+    /// bytes as they were.
+    #[test]
+    fn no_tiles_without_a_heap_and_no_heap_made() {
+        let before = STATS[3].load(Ordering::Relaxed);
+        // More tiles than one heap holds: no heap of the pool can have them.
+        assert!(super::take_existing(HEAP_TILES + 1).is_none());
+        assert_eq!(STATS[3].load(Ordering::Relaxed), before, "a heap was made with no room");
     }
 
     #[test]
