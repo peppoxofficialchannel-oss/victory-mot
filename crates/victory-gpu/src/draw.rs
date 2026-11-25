@@ -2358,30 +2358,55 @@ impl State {
 
     /// After a dispatch of `p`: the stand-in for indirect light
     /// ([`crate::ambient`]), if `p` is the program that resolves it and
-    /// the stand-in is on. Whether anything was recorded.
+    /// the stand-in is on; or the reflections held to it, after the program
+    /// that writes them last (Belobug). Whether anything was recorded.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
-        if crate::ambient::level().is_none() {
+        if crate::ambient::level().is_none() && !crate::ambient::extended() {
             return false;
         }
-        let (slot, offset) = crate::ambient::LIGHT;
-        let named = stage.translated().used.iter().any(|u| {
-            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-        });
-        let light = match self.roots_ref(true).get(usize::from(slot)) {
-            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
-                Some(View::Unordered(r, ..)) => r,
-                _ => 0,
-            },
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let named = stage.translated().used.iter().any(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            });
+            let table = match self.roots_ref(true).get(usize::from(slot)) {
+                Some(Root::Table(table)) if named => *table,
+                _ => return None,
+            };
+            crate::descriptor::view(table + u64::from(offset) * 4)
+        };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around (Belobug c3bd561);
+            // nothing unless `VICTORY_AMBIENT_REFLECT` asks for it.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
         if light == 0 {
             once!("no stand-in for indirect light: the resolve's tables are not as expected");
             return false;
         }
-        crate::ambient::replace(list, light as This)
+        if !crate::ambient::extended() {
+            return crate::ambient::replace(list, light as This);
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// A dispatch by thread counts (`DispatchX` with the console's
@@ -3094,6 +3119,15 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            // The sky as the title reflects it: the ambient light can follow
+            // it (Belobug; this only stores the image, and nothing reads it
+            // unless `VICTORY_AMBIENT_SKY` is set).
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+                && p.stages.iter().any(|s| s.shader.draws_sky)
+                && let Some(&sky) = self.targets.first()
+            {
+                crate::ambient::sky_drawn(sky);
+            }
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);

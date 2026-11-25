@@ -67,6 +67,13 @@ pub(crate) struct Shader {
     /// ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
     /// It draws the exposure that the tone pass reads ([`crate::exposure`]).
     #[cfg(windows)]
     pub(crate) writes_exposure: bool,
@@ -147,6 +154,14 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             resolves_light: crate::ambient::resolves(bytes),
+            #[cfg(windows)]
+            draws_sky: bytes
+                .windows(crate::ambient::SKY.len())
+                .any(|w| w == crate::ambient::SKY),
+            #[cfg(windows)]
+            ends_reflections: bytes
+                .windows(crate::ambient::REFLECTED.len())
+                .any(|w| w == crate::ambient::REFLECTED),
             #[cfg(windows)]
             writes_exposure: crate::exposure::writes(bytes),
             #[cfg(windows)]
@@ -252,6 +267,8 @@ impl Shader {
                     hash: self.hash.clone(),
                     container: self.container.clone(),
                     resolves_light: self.resolves_light,
+                    draws_sky: self.draws_sky,
+                    ends_reflections: self.ends_reflections,
                     writes_exposure: self.writes_exposure,
                     translated: OnceLock::new(),
                     #[cfg(feature = "diagnostics")]
