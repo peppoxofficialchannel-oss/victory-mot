@@ -3,7 +3,7 @@
 //! notes that count the lanes reaching a limit (`super::super::loop_notes`). A child module of
 //! the lowering, so it shares the emitter's state.
 
-use super::{Attr, Bin, Lower, Tag, Term, V};
+use super::{Attr, Bin, LaneExit, Lower, Tag, Term, V};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -41,10 +41,11 @@ pub(in crate::emit) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
 /// otherwise ([`Lower::count_iteration`]). The console runs such a loop as
 /// long as its data says; data the host has not mirrored yet (a null view
 /// reads zeros) can make that four billion iterations, which hangs the host
-/// GPU until the driver resets it. A lane that reaches the limit where the
-/// loop branches back on a condition leaves the loop and goes on with the
-/// program; one where it jumps back leaves the program as killed (a pixel
-/// discards). A loop whose code fixes its count (`trip`) runs it all.
+/// GPU until the driver resets it. A lane that reaches the limit leaves the
+/// loop and goes on with the program: where the loop branches back on a
+/// condition, or, in a loop that goes round by jumps back, at its exit; only
+/// on a way round that passes no exit does it leave the program as killed (a
+/// pixel discards). A loop whose code fixes its count (`trip`) runs it all.
 // shortcut: a genuine loop of more iterations than the limit is cut short too.
 pub(in crate::emit) const PIXEL_LOOP_LIMIT: u32 = 1 << 7;
 /// The same for vertex and mesh programs.
@@ -72,6 +73,91 @@ impl Lower<'_> {
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
+        let limit = self.s.m.i32(self.limit_of(to));
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        let over = self.s.m.cmp(c, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        over
+    }
+
+    /// Where a loop that goes round by jumps back alone can leave (IR block
+    /// `b`'s branch to `taken` or `not_taken`, one inside the loop, one out):
+    /// the loop's header, and whether the way inside is `taken`. A lane at
+    /// the limit leaves there and goes on with the program ([`Self::limit_test`])
+    /// rather than at its jump back, where it could only leave the program.
+    pub(super) fn jump_loop_exit(
+        &self,
+        b: usize,
+        taken: usize,
+        not_taken: usize,
+    ) -> Option<(usize, bool)> {
+        let (h, body) = self.jump_loops.iter().find(|(_, body)| body[b])?;
+        match (body[taken], body[not_taken]) {
+            (true, false) => Some((*h, true)),
+            (false, true) => Some((*h, false)),
+            _ => None,
+        }
+    }
+
+    /// The counted loops that go round by jumps back alone, innermost first,
+    /// with their blocks ([`Self::jump_loop_exit`]).
+    pub(super) fn find_jump_loops(&mut self) {
+        let p = self.x.p;
+        let reached = |l: &Self, q: usize| l.block[q].is_some();
+        for &h in self.counters.keys() {
+            let latches: Vec<usize> = p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| reached(self, q) && self.rpo[h] <= self.rpo[q])
+                .collect();
+            if !latches
+                .iter()
+                .all(|&q| matches!(self.x.st.exits[q], LaneExit::Jump(_)))
+            {
+                continue;
+            }
+            let mut body = vec![false; p.blocks.len()];
+            body[h] = true;
+            let mut stack = latches;
+            while let Some(q) = stack.pop() {
+                if !std::mem::replace(&mut body[q], true) {
+                    stack.extend(
+                        p.blocks[q]
+                            .preds
+                            .iter()
+                            .copied()
+                            .filter(|&x| reached(self, x)),
+                    );
+                }
+            }
+            self.jump_loops.push((h, body));
+        }
+        self.jump_loops
+            .sort_by_key(|(h, body)| (body.iter().filter(|&&x| x).count(), *h));
+    }
+
+    /// The count of loop `h` this pass plus one compared with its limit by `p`
+    /// (below: go on; at or above: stop), as at its back edges, without
+    /// counting.
+    pub(super) fn limit_test(&mut self, h: usize, p: u8) -> V {
+        let c = self.cur;
+        let (phi, _) = self.counters[&h];
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        self.s.m.tag(next, Tag::Counter);
+        let limit = self.s.m.i32(self.limit_of(h));
+        let r = self.s.m.cmp(c, p, next, limit);
+        self.s.m.tag(r, Tag::Counter);
+        r
+    }
+
+    /// The limit of the loop of header `to`.
+    fn limit_of(&self, to: usize) -> u32 {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -81,8 +167,16 @@ impl Lower<'_> {
         // past 256 or a compute loop past 4,096 is cut short. (They were
         // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
+        // loop cut at 64 it ran 90 frames. Raised to those again on
+        // 2026-11-25, after the fixes of loops that ran long for other reasons
+        // (helper lanes, fixed counts, exchanges in loops), the opening
+        // cutscene lost the card again 9 minutes in, and loop notes named
+        // loops still without an end: PS_Textured_Eight's search of its
+        // shadow cascades, whose count it reads as 0 (b37565055f2f7d3b,
+        // 1af4a50c7fb40c97: 10,441 pixels at 1,024), and the projected-decal
+        // resolve's walk of its decal bits (c4183d3cbee28e8e, in the
+        // approximate one-host-wave form: 10,381 lanes at 65,536). Raise them
+        // once those end.)
         let limits = super::super::loop_limits();
         let limit = if self.s.pixel {
             limits.pixel
@@ -100,19 +194,10 @@ impl Lower<'_> {
         // the 65,536 texels of the three tables stopped at a half or a quarter
         // of its samples, in all six loops, counted with `VICTORY_LOOP_NOTES=1`
         // in the opening cutscene.)
-        let limit = match self.passes.get(&to) {
+        match self.passes.get(&to) {
             Some(&n) => limit.max(n.saturating_add(1)),
             None => limit,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
+        }
     }
 
     /// The block a lane stopped by its loop's limit leaves through.
@@ -171,12 +256,13 @@ impl Lower<'_> {
     }
 
     /// With loop notes: the exit edge of IR block `b`'s branch to `to` (DXIL
-    /// block `via`), whose other edge goes back to the counted `header`, made
-    /// to pass a test of `wanted` (the branch's own condition, before the
-    /// limit) that counts the lanes leaving at the limit ([`Self::note_block`]):
-    /// those that wanted to take the back edge when it is the branch's taken
-    /// side (`back_taken`), those that did not otherwise. The block the branch
-    /// now goes to, and the one `to` is now entered from.
+    /// block `via`), whose other edge stays in the counted loop of `header`
+    /// (its back edge, or the way on to a jump back), made to pass a test of
+    /// `wanted` (the branch's own condition, before the limit) that counts the
+    /// lanes leaving at the limit ([`Self::note_block`]): those that wanted to
+    /// stay when staying is the branch's taken side (`back_taken`), those that
+    /// did not otherwise. The block the branch now goes to, and the one `to`
+    /// is now entered from.
     pub(super) fn note_exit(
         &mut self,
         b: usize,

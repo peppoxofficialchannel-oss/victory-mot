@@ -105,15 +105,37 @@ fn a_loop_whose_branch_back_holds_leaves_at_the_limit_and_goes_on() {
 }
 
 #[test]
-fn a_loop_closed_by_a_jump_takes_the_lane_out_at_the_limit() {
+fn a_loop_closed_by_a_jump_is_left_at_its_exit_at_the_limit() {
     // The same count, left by a forward branch when s6 reaches s0 (0) and
-    // closed by `s_branch`: at the limit the lane leaves the program.
+    // closed by `s_branch`: at the limit the lane leaves by that branch and
+    // goes on, as at a branch back.
     let body = [
         s_mov_b32(6, 0x80),
         S_ADD_S6_1,
         S_CMP_EQ_S6_S0,
         0xBF85_0001,             // s_cbranch_scc1 (past the s_branch)
         0xBF82_FFFC,             // s_branch (back to the s_add)
+        vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
+    ];
+    for (label, stored, notes) in run(&body) {
+        assert_eq!(stored, COMPUTE_LOOP_LIMIT, "{label}");
+        assert_eq!(record(&notes, 0), [32 + 1, 32, 0, 0], "{label}");
+    }
+}
+
+#[test]
+fn a_way_round_that_passes_no_exit_takes_the_lane_out_at_the_limit() {
+    // The exit test is skipped on the way round (s6 differs from s0 = 0, so
+    // the branch over it is always taken): at the limit the jump back takes
+    // the lane out of the program.
+    let body = [
+        s_mov_b32(6, 0x80),
+        S_ADD_S6_1,
+        S_CMP_LG_S6_S0,
+        0xBF85_0002, // s_cbranch_scc1 (over the exit test, to the s_branch)
+        S_CMP_EQ_S6_S0,
+        0xBF85_0001,             // s_cbranch_scc1 (out, past the s_branch)
+        0xBF82_FFFA,             // s_branch (back to the s_add)
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ];
     for (label, stored, notes) in run(&body) {

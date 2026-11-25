@@ -323,6 +323,9 @@ struct Lower<'a> {
     /// Loops whose code fixes how often they go round again
     /// (`trip::constant_passes`), by header IR block.
     passes: HashMap<usize, u32>,
+    /// Counted loops that go round by jumps back alone, innermost first: the
+    /// header and the blocks of the loop ([`Self::jump_loop_exit`]).
+    jump_loops: Vec<(usize, Vec<bool>)>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
@@ -1357,6 +1360,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             passes: HashMap::new(),
+            jump_loops: Vec::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             notes: None,
@@ -2098,6 +2102,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        self.find_jump_loops();
         if notes_on() {
             // Numbered by their first code byte, which the host logs too.
             let mut headers: Vec<usize> = self.counters.keys().copied().collect();
@@ -10697,12 +10702,31 @@ impl<'a> Lower<'a> {
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let wanted = cond;
+                // A loop that goes round by jumps back alone is left at the
+                // limit where it can leave, so the lane goes on with the
+                // program (its jump back still ends the lane, for a way round
+                // that passes no exit). Taken out of the program there, the
+                // pixels of PS_Textured_Eight's runaway search of its shadow
+                // cascades were discarded: holes in the objects it draws.
+                let leaves = if back(self, taken) || back(self, not_taken) {
+                    None
+                } else {
+                    self.jump_loop_exit(b, taken, not_taken)
+                };
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some((h, stay_taken)) = leaves {
+                    if stay_taken {
+                        let ok = self.limit_test(h, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else {
+                        let stop = self.limit_test(h, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    }
                 } else {
                     cond
                 };
@@ -10711,14 +10735,18 @@ impl<'a> Lower<'a> {
                 let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
                 // With loop notes, the exit of a counted back edge passes a
                 // block that counts the lanes leaving at the limit.
-                let header = [taken, not_taken].into_iter().find(|&h| back(self, h));
+                // (the header, and whether the way that stays in the loop is `taken`)
+                let header = match [taken, not_taken].into_iter().find(|&h| back(self, h)) {
+                    Some(h) => Some((h, h == taken)),
+                    None => leaves,
+                };
                 let noted = match header {
-                    Some(h) if self.notes.is_some() && h == taken => {
+                    Some((h, true)) if self.notes.is_some() => {
                         let (x, pred) = self.note_exit(b, not_taken, f, h, wanted, true);
                         f = x;
                         Some((not_taken, pred))
                     }
-                    Some(h) if self.notes.is_some() => {
+                    Some((h, false)) if self.notes.is_some() => {
                         let (x, pred) = self.note_exit(b, taken, t, h, wanted, false);
                         t = x;
                         Some((taken, pred))
