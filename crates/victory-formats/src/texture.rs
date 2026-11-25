@@ -639,18 +639,23 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if row_pitch < bytes || (depth > 1 && depth_pitch < slice_bytes) {
+            return Err(Error::TooSmall);
+        }
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
+            .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
         let (tiled_len, linear_len) = if DETILE {
             (src.len(), dst.len())
         } else {
             (dst.len(), src.len())
         };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_len < self.size as usize || linear_len < need {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -1152,6 +1157,46 @@ mod tests {
             layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
             Err(Error::TooSmall)
         );
+    }
+
+    #[test]
+    fn volume_copies_reject_overlapping_slices() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(4, 2, 1, 4, swizzle)
+            })
+            .unwrap();
+            let row_pitch = 21;
+            let row_bytes = 16;
+            let slice_bytes = row_pitch + row_bytes;
+            let input: Vec<u8> = (0..2 * slice_bytes).map(|n| n as u8).collect();
+            let mut tiled = vec![0xcc; layout.size as usize];
+            let mut output = vec![0xcc; input.len()];
+
+            let bad_pitch = slice_bytes - 1;
+            let into = layout.tile(&mut tiled, 0, 0, &input, row_pitch, bad_pitch);
+            let from = layout.detile(&tiled, 0, 0, &mut output, row_pitch, bad_pitch);
+            assert_eq!((into, from), (Err(Error::TooSmall), Err(Error::TooSmall)));
+            assert!(tiled.iter().chain(&output).all(|&byte| byte == 0xcc));
+
+            layout
+                .tile(&mut tiled, 0, 0, &input, row_pitch, slice_bytes)
+                .unwrap();
+            layout
+                .detile(&tiled, 0, 0, &mut output, row_pitch, slice_bytes)
+                .unwrap();
+            for (source, destination) in input.chunks(slice_bytes).zip(output.chunks(slice_bytes)) {
+                assert_eq!(destination[..row_bytes], source[..row_bytes]);
+                assert_eq!(destination[row_pitch..], source[row_pitch..]);
+                assert!(
+                    destination[row_bytes..row_pitch]
+                        .iter()
+                        .all(|&byte| byte == 0xcc)
+                );
+            }
+        }
     }
 
     #[test]
