@@ -1708,17 +1708,53 @@ fn back_piece(
     // data (one cleared a bit of a record the title had already replaced,
     // and copying it back broke the title's object: an access violation
     // through 0xffffffff00000000; PalmVIDev e0b70476, VIctory f39c6c2).
+    //
+    // The merge above, over a stretch, byte by byte (the fallback below and
+    // the tail); returns the bytes in which the result differs from the
+    // title's as read (ORed: zero if none does).
+    fn merge(t: &mut [u8], h: &mut [u8], o: &[u8], m: &mut [u8]) -> u8 {
+        let mut differs = 0u8;
+        for (((t, h), o), m) in t.iter_mut().zip(h.iter_mut()).zip(o).zip(m.iter_mut()) {
+            let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
+            let merged = (*t & !gpu) | (*h & gpu);
+            *m = merged ^ *t;
+            differs |= *m;
+            *t = merged;
+            *h = merged;
+        }
+        differs
+    }
     mask.clear();
     mask.resize(n, 0);
     let mut differs = 0u8;
-    for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
-        let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
-        let merged = (*t & !gpu) | (*h & gpu);
-        *m = merged ^ *t;
-        differs |= *m;
-        *t = merged;
-        *h = merged;
+    // Eight bytes at a time: where the copy holds what it held before the
+    // submission, `gpu` is 0 for every byte of the word (`gpu` is
+    // `(h != o) & (t == o)`), so the word merges to the title's own bytes
+    // with nothing marked -- no title byte changes, no mask byte is set,
+    // `differs` gains nothing -- and only the copy takes the title's bytes,
+    // as the byte loop has it do. A word the copy moved in, by however
+    // little, is merged byte by byte; so is the tail.
+    let whole = n & !7;
+    let (words_title, tail_title) = title.split_at_mut(whole);
+    let (words_host, tail_host) = host.split_at_mut(whole);
+    let (words_mask, tail_mask) = mask.split_at_mut(whole);
+    let (words_old, tail_old) = old.split_at(whole);
+    let (words_title, _) = words_title.as_chunks_mut::<8>();
+    let (words_host, _) = words_host.as_chunks_mut::<8>();
+    let (words_old, _) = words_old.as_chunks::<8>();
+    let (words_mask, _) = words_mask.as_chunks_mut::<8>();
+    for (((t, h), o), m) in words_title.iter_mut().zip(words_host).zip(words_old).zip(words_mask) {
+        if *h == *o {
+            // Untouched by the GPU: the copy takes the title's bytes (the
+            // byte loop writes `merged`, which is the title's here).
+            if *t != *o {
+                *h = *t;
+            }
+            continue;
+        }
+        differs |= merge(t, h, o, m);
     }
+    differs |= merge(tail_title, tail_host, tail_old, tail_mask);
     if differs == 0 {
         return None;
     }
@@ -1877,6 +1913,79 @@ mod merge_tests {
         let mut host: Vec<u8> = old.iter().map(|b| !b).collect();
         assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, |_, into| into.len() == PIECE), Some((0, PIECE)));
         assert_eq!(scratch.len(), PIECE);
+    }
+
+    /// The merge eight bytes at a time is the same merge as byte by byte:
+    /// the title's byte where the copy's is what it was before the
+    /// submission, the copy's where it moved and the title left its own,
+    /// and nothing else -- the copy takes the result, the runs are exactly
+    /// its bytes that differ from the title's as read, and a stretch where
+    /// none does is no change at all.
+    #[test]
+    fn the_word_merge_is_the_byte_merge() {
+        // Deterministic pseudo-random bytes (xorshift), no rand in a test.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        };
+        for len in [1, 7, 8, 9, 16, 17, 63, 64, 65, 271] {
+            for _ in 0..64 {
+                let old: Vec<u8> = (0..len).map(|_| next()).collect();
+                let (mut title_memory, mut host) = (old.clone(), old.clone());
+                for at in 0..len {
+                    // Each byte left as it was, changed by the title, by the
+                    // copy, or by both: the four cases of the merge.
+                    if next() & 3 == 1 {
+                        title_memory[at] ^= next() | 1;
+                    }
+                    if next() & 3 == 1 {
+                        host[at] ^= next() | 1;
+                    }
+                }
+                let gpu = host.clone();
+                // The merge, byte by byte, as `back_piece` has it.
+                let mut merged = Vec::with_capacity(len);
+                for at in 0..len {
+                    let from_the_gpu = gpu[at] != old[at] && title_memory[at] == old[at];
+                    merged.push(if from_the_gpu { gpu[at] } else { title_memory[at] });
+                }
+                let (mut scratch, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+                let read = |first: usize, into: &mut [u8]| {
+                    into.copy_from_slice(&title_memory[first..first + into.len()]);
+                    true
+                };
+                let got = back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read);
+                let Some(first) = gpu.iter().zip(&old).position(|(g, o)| g != o) else {
+                    // Nothing differs from the snapshot: nothing read, nothing written.
+                    assert_eq!(got, None);
+                    assert!(host == gpu && scratch.is_empty() && runs.is_empty());
+                    continue;
+                };
+                let last = gpu.iter().zip(&old).rposition(|(g, o)| g != o).unwrap();
+                let (stretch, before) = (&merged[first..=last], &title_memory[first..=last]);
+                assert_eq!(scratch, stretch, "{len} bytes: the title merges");
+                assert_eq!(&host[first..=last], stretch, "{len} bytes: the copy takes the result");
+                assert!(host[..first] == gpu[..first] && host[last + 1..] == gpu[last + 1..], "{len} bytes");
+                let mut wanted: Vec<(usize, usize)> = Vec::new();
+                for (at, (m, b)) in stretch.iter().zip(before).enumerate() {
+                    if m != b {
+                        match wanted.last_mut() {
+                            Some((from, n)) if *from + *n == at => *n += 1,
+                            _ => wanted.push((at, 1)),
+                        }
+                    }
+                }
+                assert_eq!(runs, wanted, "{len} bytes: the copy's bytes only");
+                if stretch == before {
+                    assert_eq!(got, None, "{len} bytes: the GPU's bytes are the title's");
+                } else {
+                    assert_eq!(got, Some((first, last + 1 - first)), "{len} bytes");
+                }
+            }
+        }
     }
 
     /// A byte the shader and the title both changed while the GPU ran keeps
