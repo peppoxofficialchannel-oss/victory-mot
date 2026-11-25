@@ -84,6 +84,15 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// group to start counting from in x, added to a compute program's group
+/// id in x. A host dispatch runs at most 65,535 groups in each dimension,
+/// and the console's more (the depth-of-field blur asks for up to 115,200,
+/// one per tile of each of its two layers): the host runs such a dispatch
+/// as several, each with its first group here. 0 for any other dispatch.
+/// Not asked by programs with a spilled user-data table (their root
+/// signature is close to the host's 64 dwords).
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

@@ -60,6 +60,10 @@ static const uint BUDGET = 1u << 27;
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Kind 3, a dispatch whose program counts its groups in x from a base
+// (`USER_GROUP_BASE`): each record becomes SPLIT records of four words, the
+// base then the three counts, each at most 65,535 groups in x from its base.
+static const uint SPLIT = 4u;
 // Each group charges the budget once: the costs of its records go here,
 // one thread charges their sum, saturating as each record would in lane
 // order, and every thread then reads whether its own record fitted. A
@@ -117,10 +121,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             cost = 0;
         }
         draw_counts = uint2(count, instances);
-    } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+    } else if (active && (kind == 2 || kind == 3)) {
+        // The most groups in x that run: one dispatch's, or a split
+        // dispatch's SPLIT of them.
+        uint widest = kind == 3u ? 65535u * SPLIT : 65535u;
+        uint3 g = min(src_args.Load3(src_at), uint3(widest, 65535u, 65535u));
+        // x * y fits 32 bits once y is checked against x; the whole count
+        // may not.
+        if ((g.x != 0 && g.y > GROUPS / g.x) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64u;
@@ -141,7 +149,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind > 3) {
         // Diagnostics, in the budget buffer's next words (below): the
         // largest group count a mesh record asked for, and the groups
         // asked in all.
@@ -187,12 +195,19 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2 && n > 0) {
+    if (gi == 0 && kind > 3 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
     }
     if (!active) {
+        // The host runs every record of a split dispatch (the count is the
+        // clamp's alone): those past the count run empty.
+        if (kind == 3u && id.x < records) {
+            for (uint k = 0; k < SPLIT; k++) {
+                dst_args.Store4(id.x * SPLIT * 16u + k * 16u, uint4(k * 65535u, 0u, 0u, 0u));
+            }
+        }
         return;
     }
     bool over = fits[gi] == 0;
@@ -203,6 +218,19 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         dst_args.Store2(dst_at, draw_counts);
         for (uint off = 8; off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else if (kind == 3) {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        // Record k runs the groups from k * 65,535 on: the base, then the
+        // counts (none past the groups asked for).
+        uint at = id.x * SPLIT * 16u;
+        for (uint k = 0; k < SPLIT; k++) {
+            uint first = k * 65535u;
+            uint gx = groups.x > first ? min(groups.x - first, 65535u) : 0u;
+            uint3 g = gx != 0u ? uint3(gx, groups.y, groups.z) : uint3(0u, 0u, 0u);
+            dst_args.Store4(at + k * 16u, uint4(first, g));
         }
     } else {
         if (over) {
@@ -300,14 +328,38 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     }
 }
 
+/// The clamp's own kind (not a D3D12 argument type): dispatch records of a
+/// program that counts its groups in x from a base the host gives it
+/// (`victory_shader::emit::USER_GROUP_BASE`), each clamped into [`SPLIT`]
+/// records of [`SPLIT_STRIDE`] bytes: the base, then the three group
+/// counts, for a command signature that sets the base and dispatches.
+/// One host dispatch runs at most 65,535 groups in x; the title's
+/// depth-of-field blur asks for up to 115,200 (one group per tile of each
+/// of its two layers, 2560x1440 in 8x8 tiles), cut to 65,535 before, so
+/// the farther layer was left unblurred below a row of the picture.
+pub(crate) const SPLIT_DISPATCH: u32 = 3;
+/// Records a split dispatch record becomes: up to 4 x 65,535 groups in x.
+pub(crate) const SPLIT: u32 = 4;
+/// Bytes of a record of a split dispatch: base, x, y, z.
+pub(crate) const SPLIT_STRIDE: u32 = 16;
+
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
 fn min_stride(kind: u32) -> Option<u32> {
     match kind {
         0 => Some(16),
         1 => Some(20),
-        2 | 10 => Some(12),
+        2 | SPLIT_DISPATCH | 10 => Some(12),
         _ => None,
     }
+}
+
+/// Bytes the clamped records of `spec` take in the scratch buffer: as many
+/// as the title's, but [`SPLIT`] records of [`SPLIT_STRIDE`] for each of a
+/// split dispatch's.
+fn scratch_bytes((kind, stride, records): (u32, u32, u32)) -> Option<u64> {
+    let each = if kind == SPLIT_DISPATCH { SPLIT * SPLIT_STRIDE } else { stride };
+    let bytes = u64::from(each).checked_mul(u64::from(records))?;
+    (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
 /// Validates record alignment and returns the scratch byte size `stride * records`.
@@ -341,7 +393,9 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    // What the clamped records take (a split dispatch's are bigger).
+    let bytes = scratch_bytes(spec)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
@@ -361,7 +415,8 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
+    validate_layout(spec, src.1, None)?;
+    let bytes = scratch_bytes(spec)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
@@ -1167,7 +1222,12 @@ void main() {
         assert_eq!(validate_layout((2, 8, 1), 0, None), None);
         assert_eq!(validate_layout((10, 8, 1), 0, None), None);
         // Unknown kind.
-        assert_eq!(validate_layout((3, 16, 1), 0, None), None);
+        assert_eq!(validate_layout((4, 16, 1), 0, None), None);
+        // A split dispatch reads plain dispatch records and writes four
+        // records of base and counts for each.
+        assert_eq!(validate_layout((SPLIT_DISPATCH, 12, 2), 0, None), Some(24));
+        assert_eq!(scratch_bytes((SPLIT_DISPATCH, 12, 2)), Some(128));
+        assert_eq!(scratch_bytes((2, 12, 2)), Some(24));
         // Unaligned stride, source offset, or count offset.
         assert_eq!(validate_layout((0, 18, 1), 0, None), None);
         assert_eq!(validate_layout((0, 16, 1), 2, None), None);
@@ -1384,6 +1444,128 @@ void main() {
         // Inactive slot 3 was never copied from `src_args`.
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
+
+    /// A dispatch record of more groups in x than one dispatch runs, clamped
+    /// as a split dispatch (`SPLIT_DISPATCH`) and run through a signature that
+    /// sets each part's first group as a root constant: every group from 0
+    /// to 99,999 runs once, as the console runs it (one dispatch cut it to
+    /// 65,535); a record past the count buffer's count runs empty.
+    #[test]
+    fn warp_split_dispatch_runs_every_group_once() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const GROUPS: u32 = 100_000;
+        const WORDS: u32 = GROUPS.div_ceil(32) + 1;
+        let worker = compile_cs(&warp.device, SPLIT_WORKER_CS).expect("split worker shader must compile");
+        let (src_buf, src_ptr, _) = warp.shared_buffer(64);
+        let (count_buf, count_ptr, _) = warp.shared_buffer(16);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(u64::from(WORDS) * 4 + 4);
+        let records = 2;
+        let dst_bytes = scratch_bytes((SPLIT_DISPATCH, 12, records)).unwrap();
+        assert_eq!(dst_bytes, u64::from(records * SPLIT * SPLIT_STRIDE));
+        let dst_buf = warp.default_uav(dst_bytes);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(dst_bytes);
+        // Record 0: 100,000 groups in x; record 1, past the count of 1: 5.
+        let words: [u32; 6] = [GROUPS, 1, 1, 5, 1, 1];
+        // SAFETY: buffers mapped with room for what is written.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr, 24);
+            (count_ptr as *mut u32).write_volatile(1);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, (WORDS * 4 + 4) as usize);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            Some((&count_buf, 0)),
+            (SPLIT_DISPATCH, 12, records),
+            false,
+        ));
+        let arguments = [
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: 0,
+                        DestOffsetIn32BitValues: 0,
+                        Num32BitValuesToSet: 1,
+                    },
+                },
+            },
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            },
+        ];
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: SPLIT_STRIDE,
+            NumArgumentDescs: 2,
+            pArgumentDescs: arguments.as_ptr(),
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: an open list of ours; live buffers, root signature and
+        // pipeline; the signature's root constant is the worker's parameter 0.
+        unsafe {
+            warp.device.CreateCommandSignature(&desc, &worker.root, &mut sig).unwrap();
+            warp.list.SetComputeRootSignature(&worker.root);
+            warp.list.SetPipelineState(&worker.pso);
+            warp.list.SetComputeRoot32BitConstant(0, 0, 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+            warp.list.ExecuteIndirect(sig.as_ref().unwrap(), records * SPLIT, &dst_buf, 0, None, 0);
+        }
+        // SAFETY: as above; the clamp left the scratch buffer readable as
+        // indirect arguments.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, dst_bytes);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped host buffers.
+        let (bits, ran, spent, clamped) = unsafe {
+            let all = std::slice::from_raw_parts(hits_ptr.cast::<u32>().cast_const(), WORDS as usize + 1).to_vec();
+            let spent = (budget_ptr as *const u32).read_volatile();
+            let clamped =
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (dst_bytes / 4) as usize).to_vec();
+            (all[1..].to_vec(), all[0], spent, clamped)
+        };
+        assert_eq!(ran, GROUPS, "every group runs once");
+        for index in 0..WORDS * 32 {
+            let set = bits[(index / 32) as usize] & (1 << (index % 32)) != 0;
+            assert_eq!(set, index < GROUPS, "group {index}");
+        }
+        assert_eq!(spent, GROUPS * 64, "the budget is charged the groups that run");
+        // Record 0 in four parts from 0, 65,535, 131,070 and 196,605; record
+        // 1, past the count, empty.
+        assert_eq!(&clamped[..16], &[0, 65_535, 1, 1, 65_535, 34_465, 1, 1, 131_070, 0, 0, 0, 196_605, 0, 0, 0]);
+        assert_eq!(&clamped[16..], &[0, 0, 0, 0, 65_535, 0, 0, 0, 131_070, 0, 0, 0, 196_605, 0, 0, 0]);
+    }
+
+    /// The program a split dispatch runs in [`warp_split_dispatch_runs_every_group_once`]:
+    /// it counts its groups from the base a root constant gives it, and sets
+    /// the bit of each group it runs (word 0 counts them).
+    const SPLIT_WORKER_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Base : register(b0) { uint base; };
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    uint group = base + g.x;
+    uint prev;
+    hits.InterlockedAdd(0, 1, prev);
+    hits.InterlockedOr(4 + (group / 32) * 4, 1u << (group % 32), prev);
+}
+"#;
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
     /// wraparound across >64 huge indexed-draw records (`count = None`), while

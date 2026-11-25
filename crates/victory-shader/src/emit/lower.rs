@@ -2327,7 +2327,19 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let id = self.compute_id("groupId.i32", 94, c);
+                // In x, counted from the group the host starts this
+                // dispatch at (`shader.rs` `USER_GROUP_BASE`): the host runs
+                // a dispatch of more groups than it allows as several.
+                if c != 0 || self.user_first() != 0 {
+                    return id;
+                }
+                let Val::I32(g) = id else { unreachable!() };
+                use super::shader::USER_GROUP_BASE;
+                let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -11097,6 +11109,11 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lower_cs(words, rsrc2).map(|_| ())
+    }
+
+    /// A synthetic compute program with these input registers, lowered.
+    fn lower_cs(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -11125,7 +11142,23 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// A compute program's group id in x is counted from the group the host
+    /// starts its dispatch at (`USER_GROUP_BASE`, a user-data dword the host
+    /// computes): the host runs a dispatch of more than 65,535 groups in x
+    /// as several. Its group id in y is not.
+    #[test]
+    fn group_id_in_x_is_counted_from_the_hosts_base() {
+        use super::super::shader::USER_GROUP_BASE;
+        let base = RootType::Other(USER_GROUP_BASE);
+        // s_cmp_eq_u32 s<reg>, 0; a branch over a move; the end.
+        let program = |reg: u32| [0xBF06_8000 | reg, 0xBF85_0001, 0xBE86_0380, S_ENDPGM];
+        let group_ids_xy = 3 << 7;
+        let x = lower_cs(&program(0), group_ids_xy).expect("reads the group id in x");
+        assert_eq!(x.user_data.iter().filter(|u| u.root == base).count(), 1);
+        let y = lower_cs(&program(1), 2 << 7).expect("reads the group id in y");
+        assert!(y.user_data.iter().all(|u| u.root != base));
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
