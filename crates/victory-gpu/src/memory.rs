@@ -29,14 +29,16 @@
 //! pair of root constants that is a title address and around each root
 //! constant that is one in 256-byte units (the builder passes structures
 //! all three ways), and the 4 MiB after each (a structure may cross a
-//! window's end); and all list upload memory (`crate::list::upload`),
-//! where the builder records the tables its stages read through pointers
-//! (InitHeaders' table of structure addresses).
-//! shortcut: what a stage reaches only through pointers into other memory
-//! is not made ready unless something else named it; the fault count in
-//! the log says whether that happens. The whole answer is the extent of
-//! the title's allocation around an address, which the memory module of
-//! the layer knows and this one does not ask yet.
+//! window's end); all list upload memory (`crate::list::upload`), where
+//! the builder records the tables its stages read through pointers
+//! (InitHeaders' table of structure addresses); and the title addresses in
+//! the block of upload memory a root view points into (the leaf
+//! rehydration's geometry descriptions: its index and vertex buffers).
+//! shortcut: what a stage reaches only through pointers into other title
+//! memory is not made ready unless something else named it; the fault
+//! count in the log says whether that happens. The whole answer is the
+//! extent of the title's allocation around an address, which the memory
+//! module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
@@ -264,6 +266,37 @@ impl Memory {
 /// it may store to title memory through an address.
 pub(crate) const STORES: usize = usize::MAX - 0x6f;
 
+/// Bytes of a block of list upload memory looked through for title
+/// addresses, from a root SRV's address on: some 340 geometry descriptions.
+const SCAN: u64 = 16 << 10;
+
+/// The 8-byte values of `bytes` (from an 8-byte boundary) that are title
+/// addresses as the builder writes them: bits 32 to 39 set, nothing above,
+/// and a low dword of 64 KiB or more (as for an address in two constants;
+/// an address that is not the title's memory is refused when named).
+fn title_addresses(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    bytes.chunks_exact(8).filter_map(|q| {
+        let v = u64::from_le_bytes(q.try_into().ok()?);
+        ((1..=0xFF).contains(&(v >> 32)) && v as u32 >= 0x1_0000).then_some(v)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn title_addresses_are_found_in_geometry_records() {
+        // A geometry description as the builder copies it into upload memory
+        // (48 bytes): no transform, index and vertex formats, counts, the
+        // index buffer, the vertex buffer and its stride.
+        let mut record = Vec::new();
+        for v in [0u64, 0x10_0000_0035, 0x508_0000_1263, 0xb_13f6_53a0, 0xb_13f0_8bc0, 8] {
+            record.extend_from_slice(&v.to_le_bytes());
+        }
+        let found: Vec<u64> = super::title_addresses(&record).collect();
+        assert_eq!(found, [0xb_13f6_53a0, 0xb_13f0_8bc0]);
+    }
+}
+
 /// `VICTORY_MEMORY_ALL=1`: every list that runs a shader reaching title
 /// memory by address brings every numbered copy up to date and, if the
 /// shader can store through an address, declares every one written, as
@@ -275,15 +308,18 @@ fn all_copies() -> bool {
 
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
-/// `constants`: its root constants, see the module), every numbered copy
-/// has its view in `heap`'s run and is brought up to date when `list` is
-/// submitted (and, with `writes`, copied back after). None if the host
-/// cannot hold it; the draw is then dropped.
+/// `constants`: its root constants, see the module; `records`: the root
+/// views of the shader's root SRVs, whose blocks of list upload memory may
+/// hold title addresses), every numbered copy has its view in `heap`'s run
+/// and is brought up to date when `list` is submitted (and, with `writes`,
+/// copied back after). None if the host cannot hold it; the draw is then
+/// dropped.
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
+    records: &[u64],
     writes: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,6 +346,30 @@ pub(crate) fn ready(
     if let Some((start, len)) = crate::list::upload::span() {
         for chunk in (start..start + len).step_by(crate::list::upload::CHUNK) {
             upload.extend(m.map(chunk, "upload memory"));
+        }
+    }
+    // Title addresses in the blocks of list upload memory a dispatch reads
+    // through its root SRVs: the builder's leaf rehydration takes its
+    // geometry (index and vertex buffers) by address out of its 48-byte
+    // records there, which no root argument names. In rt-int1, 638 of the
+    // 2,139 such addresses lay in no copy when the stage ran: those leaves
+    // read zeros. The builder fills the records before it records the
+    // dispatch. Looked through up to what the list has handed out (the
+    // block, and those after it), [`SCAN`] bytes at most.
+    for &address in records {
+        let Some(handed) = crate::list::upload::handed_end(address) else {
+            continue;
+        };
+        let from = address & !7;
+        let end = handed.min(address.saturating_add(SCAN));
+        if end <= from {
+            continue;
+        }
+        let mut bytes = vec![0u8; (end - from) as usize];
+        if crate::host::read_into(from as *const u8, &mut bytes) {
+            for pointer in title_addresses(&bytes) {
+                named.extend(m.name(pointer, "address in upload memory").into_iter().flatten());
+            }
         }
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
