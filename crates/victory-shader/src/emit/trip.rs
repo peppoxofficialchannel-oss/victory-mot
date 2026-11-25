@@ -41,11 +41,23 @@ pub(super) fn constant_passes(p: &Program, rpo: &[usize], header: usize) -> Opti
     let body = body(p, header, latch);
     // The block that decides, and which way of its branch stays in the loop.
     let (test, stay) = match p.blocks[latch].exit {
-        Exit::Branch { taken, not_taken } if taken == header && !body.contains(&not_taken) => (latch, true),
-        Exit::Branch { taken, not_taken } if not_taken == header && !body.contains(&taken) => (latch, false),
+        Exit::Branch { taken, not_taken } if taken == header && !body.contains(&not_taken) => {
+            (latch, true)
+        }
+        Exit::Branch { taken, not_taken } if not_taken == header && !body.contains(&taken) => {
+            (latch, false)
+        }
         Exit::Jump(_) => match p.blocks[header].exit {
-            Exit::Branch { taken, not_taken } if body.contains(&taken) && !body.contains(&not_taken) => (header, true),
-            Exit::Branch { taken, not_taken } if body.contains(&not_taken) && !body.contains(&taken) => (header, false),
+            Exit::Branch { taken, not_taken }
+                if body.contains(&taken) && !body.contains(&not_taken) =>
+            {
+                (header, true)
+            }
+            Exit::Branch { taken, not_taken }
+                if body.contains(&not_taken) && !body.contains(&taken) =>
+            {
+                (header, false)
+            }
             _ => return None,
         },
         _ => return None,
@@ -103,7 +115,11 @@ pub(super) fn constant_passes(p: &Program, rpo: &[usize], header: usize) -> Opti
     // while the branch takes its staying side.
     let mut x = start.wrapping_add(offset);
     for n in 0..=MOST {
-        let holds = if swapped { op.holds(k, x) } else { op.holds(x, k) };
+        let holds = if swapped {
+            op.holds(k, x)
+        } else {
+            op.holds(x, k)
+        };
         // The branch is taken when SCC is what it tests for.
         let taken = holds == set;
         if taken != stay {
@@ -221,7 +237,11 @@ fn compare(inst: &crate::ir::Inst) -> Option<(Op, Side, Side)> {
         // SOPK: the register against the 16-bit immediate, sign-extended
         // for the signed tests.
         let imm = (*imm)?;
-        let b = if signed { imm as i16 as i32 as u32 } else { u32::from(imm) };
+        let b = if signed {
+            imm as i16 as i32 as u32
+        } else {
+            u32::from(imm)
+        };
         Some((op, side(src.first()?)?, Side::Const(b)))
     } else {
         Some((op, side(src.first()?)?, side(src.get(1)?)?))
@@ -256,6 +276,70 @@ fn constant(defs: &HashMap<Value, Def<'_>>, v: Value) -> Option<u32> {
     None
 }
 
+/// `v` as a header's counter plus a constant: the value it started from
+/// (a join that is not one of a single value) and what moves, adds and
+/// subtractions of constants added to it.
+fn trace(p: &Program, defs: &HashMap<Value, Def<'_>>, v: Value) -> Option<(Value, u32)> {
+    let (mut v, mut sum) = (v, 0u32);
+    for _ in 0..256 {
+        match defs.get(&v)? {
+            Def::Phi(b, i) => {
+                // A join of one value (and of itself) is that value.
+                let mut others = p.blocks[*b].phis[*i]
+                    .args
+                    .iter()
+                    .copied()
+                    .filter(|&a| a != v);
+                match others.next() {
+                    Some(one) if others.all(|a| a == one) => v = one,
+                    _ => return Some((v, sum)),
+                }
+            }
+            Def::Inst(inst) => {
+                let Fields::Sop { src, imm, .. } = &inst.fields else {
+                    return None;
+                };
+                let reg = |op: &Operand| match *op {
+                    Operand::Scalar { code, dwords: 1 } => inst.read(Reg::S(code)),
+                    _ => None,
+                };
+                let konst = |op: &Operand| match *op {
+                    Operand::Const(c) => crate::resource::inline(c),
+                    Operand::Literal(l) => Some(l),
+                    _ => None,
+                };
+                match inst.name() {
+                    "s_mov_b32" => v = reg(src.first()?)?,
+                    "s_addk_i32" => {
+                        // SOPK: the destination is the source.
+                        let dst = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))?.0;
+                        v = inst.read(dst)?;
+                        sum = sum.wrapping_add((*imm)? as i16 as i32 as u32);
+                    }
+                    name @ ("s_add_u32" | "s_add_i32" | "s_sub_u32" | "s_sub_i32") => {
+                        let (a, b) = (src.first()?, src.get(1)?);
+                        let sub = name.starts_with("s_sub");
+                        let (from, k) = match (reg(a), konst(b), konst(a), reg(b)) {
+                            (Some(x), Some(k), _, _) => (x, k),
+                            // (`k - x` is no step of `x`.)
+                            (_, _, Some(k), Some(x)) if !sub => (x, k),
+                            _ => return None,
+                        };
+                        v = from;
+                        sum = if sub {
+                            sum.wrapping_sub(k)
+                        } else {
+                            sum.wrapping_add(k)
+                        };
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::constant_passes;
@@ -273,10 +357,18 @@ mod tests {
         }
         let mut headers: Vec<usize> = (0..p.blocks.len())
             .filter(|&b| rpo[b] != usize::MAX)
-            .filter(|&b| p.blocks[b].preds.iter().any(|&q| rpo[q] != usize::MAX && rpo[b] <= rpo[q]))
+            .filter(|&b| {
+                p.blocks[b]
+                    .preds
+                    .iter()
+                    .any(|&q| rpo[q] != usize::MAX && rpo[b] <= rpo[q])
+            })
             .collect();
         headers.sort_by_key(|&h| p.blocks[h].offset);
-        headers.iter().map(|&h| constant_passes(&p, &rpo, h)).collect()
+        headers
+            .iter()
+            .map(|&h| constant_passes(&p, &rpo, h))
+            .collect()
     }
 
     #[test]
@@ -345,60 +437,4 @@ mod tests {
         ];
         assert_eq!(passes(&never), [None]);
     }
-}
-
-/// `v` as a header's counter plus a constant: the value it started from
-/// (a join that is not one of a single value) and what moves, adds and
-/// subtractions of constants added to it.
-fn trace(p: &Program, defs: &HashMap<Value, Def<'_>>, v: Value) -> Option<(Value, u32)> {
-    let (mut v, mut sum) = (v, 0u32);
-    for _ in 0..256 {
-        match defs.get(&v)? {
-            Def::Phi(b, i) => {
-                // A join of one value (and of itself) is that value.
-                let mut others = p.blocks[*b].phis[*i].args.iter().copied().filter(|&a| a != v);
-                match others.next() {
-                    Some(one) if others.all(|a| a == one) => v = one,
-                    _ => return Some((v, sum)),
-                }
-            }
-            Def::Inst(inst) => {
-                let Fields::Sop { src, imm, .. } = &inst.fields else {
-                    return None;
-                };
-                let reg = |op: &Operand| match *op {
-                    Operand::Scalar { code, dwords: 1 } => inst.read(Reg::S(code)),
-                    _ => None,
-                };
-                let konst = |op: &Operand| match *op {
-                    Operand::Const(c) => crate::resource::inline(c),
-                    Operand::Literal(l) => Some(l),
-                    _ => None,
-                };
-                match inst.name() {
-                    "s_mov_b32" => v = reg(src.first()?)?,
-                    "s_addk_i32" => {
-                        // SOPK: the destination is the source.
-                        let dst = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))?.0;
-                        v = inst.read(dst)?;
-                        sum = sum.wrapping_add((*imm)? as i16 as i32 as u32);
-                    }
-                    name @ ("s_add_u32" | "s_add_i32" | "s_sub_u32" | "s_sub_i32") => {
-                        let (a, b) = (src.first()?, src.get(1)?);
-                        let sub = name.starts_with("s_sub");
-                        let (from, k) = match (reg(a), konst(b), konst(a), reg(b)) {
-                            (Some(x), Some(k), _, _) => (x, k),
-                            // (`k - x` is no step of `x`.)
-                            (_, _, Some(k), Some(x)) if !sub => (x, k),
-                            _ => return None,
-                        };
-                        v = from;
-                        sum = if sub { sum.wrapping_sub(k) } else { sum.wrapping_add(k) };
-                    }
-                    _ => return None,
-                }
-            }
-        }
-    }
-    None
 }

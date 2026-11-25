@@ -1534,7 +1534,9 @@ impl<'a> Lower<'a> {
             abort: None,
             notes: None,
             helper_scalars: x.native.stage == HwStage::Ps
-                && p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
+                && p.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -11018,10 +11020,11 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(i32t);
         let record = k * LOOP_NOTE_DWORDS * 4;
         // The loop's first code byte plus 1 (0: no record), then the count.
-        let (at, first) = (self.s.m.i32(record), self.s.m.i32(self.x.p.blocks[header].offset as u32 + 1));
+        let at = self.s.m.i32(record);
+        let first = self.s.m.i32(self.x.p.blocks[header].offset as u32 + 1);
         let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-        self.s
-            .op(n, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, at, iu, first, iu, iu, iu, mask, align]);
+        let args = [h, at, iu, first, iu, iu, iu, mask, align];
+        self.s.op(n, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
         let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
         let count = self.s.m.i32(record + if killed { 8 } else { 4 });
         self.s
@@ -11037,7 +11040,15 @@ impl<'a> Lower<'a> {
     /// those that wanted to take the back edge when it is the branch's taken
     /// side (`back_taken`), those that did not otherwise. The block the branch
     /// now goes to, and the one `to` is now entered from.
-    fn note_exit(&mut self, b: usize, to: usize, via: usize, header: usize, wanted: V, back_taken: bool) -> (usize, usize) {
+    fn note_exit(
+        &mut self,
+        b: usize,
+        to: usize,
+        via: usize,
+        header: usize,
+        wanted: V,
+        back_taken: bool,
+    ) -> (usize, usize) {
         let (test, join) = (self.s.m.new_block(), self.s.m.new_block());
         let note = self.note_block(header, false, join);
         let term = if back_taken {
@@ -11700,8 +11711,11 @@ mod tests {
             let p = ir::build(&code, wave64, 256).unwrap();
             let st = structure::structure(&p).unwrap();
             let all = super::all_lane_blocks(&st).unwrap();
+            use crate::structure::LaneExit;
+            let back =
+                |b: usize| matches!(st.exits[b], LaneExit::Branch { taken, .. } if taken == b);
             let looped = (0..p.blocks.len())
-                .find(|&b| matches!(st.exits[b], crate::structure::LaneExit::Branch { taken, .. } if taken == b))
+                .find(|&b| back(b))
                 .expect("a block that branches back to itself");
             assert!(!all[looped], "wave64 {wave64}");
             // The code before the loop and after it still is.

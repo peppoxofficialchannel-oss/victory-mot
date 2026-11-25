@@ -44,7 +44,13 @@ fn run_shader(shader: &HostShader) -> Vec<(&'static str, u32, Vec<u32>)> {
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         // The root constants and the table's heap index: all 0.
         for u in &shader.user_data {
-            assert!(matches!((u.root, u.slot), (RootType::Constants, 0) | (RootType::Table, 1)), "{u:?}");
+            assert!(
+                matches!(
+                    (u.root, u.slot),
+                    (RootType::Constants, 0) | (RootType::Table, 1)
+                ),
+                "{u:?}"
+            );
         }
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         // Root parameter 0 is the user data, 1 the notes (the only root view).
@@ -83,7 +89,7 @@ fn a_loop_whose_branch_back_holds_leaves_at_the_limit_and_goes_on() {
         s_mov_b32(6, 0x80),
         S_ADD_S6_1,
         S_CMP_LG_S6_S0,
-        0xBF85_FFFD, // s_cbranch_scc1 (back to the s_add)
+        0xBF85_FFFD,             // s_cbranch_scc1 (back to the s_add)
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ];
     for (label, stored, notes) in run(&body) {
@@ -91,7 +97,10 @@ fn a_loop_whose_branch_back_holds_leaves_at_the_limit_and_goes_on() {
         assert_eq!(stored, COMPUTE_LOOP_LIMIT, "{label}");
         // Each of the 32 counted as leaving the loop and going on.
         assert_eq!(record(&notes, 0), [32 + 1, 32, 0, 0], "{label}");
-        assert!(notes[LOOP_NOTE_DWORDS as usize..].iter().all(|&w| w == 0), "{label}");
+        assert!(
+            notes[LOOP_NOTE_DWORDS as usize..].iter().all(|&w| w == 0),
+            "{label}"
+        );
     }
 }
 
@@ -103,8 +112,8 @@ fn a_loop_closed_by_a_jump_takes_the_lane_out_at_the_limit() {
         s_mov_b32(6, 0x80),
         S_ADD_S6_1,
         S_CMP_EQ_S6_S0,
-        0xBF85_0001, // s_cbranch_scc1 (past the s_branch)
-        0xBF82_FFFC, // s_branch (back to the s_add)
+        0xBF85_0001,             // s_cbranch_scc1 (past the s_branch)
+        0xBF82_FFFC,             // s_branch (back to the s_add)
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ];
     for (label, stored, notes) in run(&body) {
@@ -139,10 +148,10 @@ fn a_loop_whose_code_fixes_its_count_runs_to_its_end_past_the_limit() {
         S_ADD_S6_1,
         0xBF07_FF06, // s_cmp_lg_u32 s6, lit(5000)
         5000,
-        0xBF85_FFFC, // s_cbranch_scc1 (back to the s_add)
+        0xBF85_FFFC,             // s_cbranch_scc1 (back to the s_add)
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ];
-    assert!(5000 > COMPUTE_LOOP_LIMIT);
+    const { assert!(5000 > COMPUTE_LOOP_LIMIT) };
     for (label, stored, notes) in run(&body) {
         assert_eq!(stored, 5000, "{label}");
         assert!(notes.iter().all(|&w| w == 0), "{label}: {notes:?}");
@@ -269,14 +278,18 @@ fn a_helper_lane_is_served_by_a_waterfall_loop_in_a_pass_of_its_own() {
     let ps = pixel(&WATERFALL_OVER_PIXELS);
     let vs = position_vs();
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut ps.dxil.clone()).expect("DXIL validation failed");
-        v.validate(&mut vs.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut ps.dxil.clone())
+            .expect("DXIL validation failed");
+        v.validate(&mut vs.dxil.clone())
+            .expect("DXIL validation failed");
     }
     // The half of an 8x8 target below its diagonal (pixels with x < y; the
     // diagonal's own are outside, by the top-left rule): in each 2x2 quad
     // on the diagonal, pixel (2i, 2i + 1) is drawn and the three others are
     // helper lanes, the one across x among them.
-    let vertices = [-1.0, -1.0, 0.5, 1.0, 1.0, -1.0, 0.5, 1.0, -1.0, 1.0, 0.5, 1.0];
+    let vertices = [
+        -1.0, -1.0, 0.5, 1.0, 1.0, -1.0, 0.5, 1.0, -1.0, 1.0, 0.5, 1.0,
+    ];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {

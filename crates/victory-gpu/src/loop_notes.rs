@@ -51,7 +51,9 @@ fn buffer() -> Option<&'static Buffer> {
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            tracing::info!("loop notes: lanes that reach a translated loop's iteration limit are counted");
+            tracing::info!(
+                "loop notes: lanes that reach a translated loop's iteration limit are counted"
+            );
             Some(Buffer {
                 _buffer: buffer,
                 data: data.cast(),
@@ -73,7 +75,12 @@ pub(crate) fn address(shader: &Shader) -> Option<u64> {
     });
     if slot >= PROGRAMS {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(PROGRAMS, "loop notes: more programs than ranges; later ones share the last"));
+        ONCE.call_once(|| {
+            tracing::warn!(
+                PROGRAMS,
+                "loop notes: more programs than ranges; later ones share the last"
+            )
+        });
     }
     Some(b.gpu + u64::from(slot.min(PROGRAMS - 1)) * u64::from(LOOP_NOTES) * 4)
 }
@@ -88,7 +95,12 @@ pub(crate) fn log() {
     let (programs, logged) = &mut *seen;
     let mut grew = Vec::new();
     let mut reached = 0;
-    for (slot, ((stage, hash), last)) in programs.iter().zip(logged.iter_mut()).enumerate().take(PROGRAMS as usize) {
+    for (slot, ((stage, hash), last)) in programs
+        .iter()
+        .zip(logged.iter_mut())
+        .enumerate()
+        .take(PROGRAMS as usize)
+    {
         let mut any = false;
         for (k, last) in last.iter_mut().enumerate() {
             let at = slot * LOOP_NOTES as usize + k * LOOP_NOTE_DWORDS as usize;
@@ -101,7 +113,8 @@ pub(crate) fn log() {
             }
             any |= left > 0 || killed > 0;
             if (left, killed) != *last {
-                let more = u64::from(left - last.0.min(left)) + u64::from(killed - last.1.min(killed));
+                let more =
+                    u64::from(left - last.0.min(left)) + u64::from(killed - last.1.min(killed));
                 grew.push((more, *stage, hash.clone(), first - 1, left, killed));
                 *last = (left, killed);
             }
@@ -111,15 +124,17 @@ pub(crate) fn log() {
     if grew.is_empty() {
         return;
     }
-    grew.sort_by(|a, b| b.0.cmp(&a.0));
+    grew.sort_by_key(|g| std::cmp::Reverse(g.0));
     for (more, stage, hash, offset, left, killed) in grew.iter().take(40) {
         tracing::info!(
-            "loop notes: {stage} {hash} loop at {offset:#x} reached its iteration limit in {more} more lanes; \
-             since the start {left} lanes left the loop there and went on, {killed} were taken out of the program"
+            "loop notes: {stage} {hash} loop at {offset:#x} reached its iteration limit in \
+             {more} more lanes; since the start {left} lanes left the loop there and went on, \
+             {killed} were taken out of the program"
         );
     }
     tracing::info!(
-        "loop notes: {reached} of {} programs drawn with counted loops have reached a limit; {} loops grew in the last lines",
+        "loop notes: {reached} of {} programs drawn with counted loops have reached a limit; \
+         {} loops grew in the last lines",
         programs.len(),
         grew.len()
     );
