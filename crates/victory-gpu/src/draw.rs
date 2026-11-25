@@ -2062,7 +2062,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                self.readable(list, sampled.kind, view);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2776,7 +2776,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            self.readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2901,7 +2901,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        self.readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -2912,7 +2912,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        self.readable(list, kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -2950,7 +2950,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            self.readable(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3112,6 +3112,17 @@ impl State {
             return false;
         };
         crate::exposure::after_draw(list, target as This)
+    }
+
+    /// What a view needs, and — with `VICTORY_EXPOSURE_READERS` — whether it
+    /// names the exposure image ([`crate::exposure::note_reader`]).
+    fn readable(&self, list: &HostList, kind: ResourceType, view: &View) {
+        readable(list, kind, view);
+        if crate::exposure::readers()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            crate::exposure::note_reader(list, view, &p.name, p.compute);
+        }
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the

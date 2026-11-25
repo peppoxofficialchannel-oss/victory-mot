@@ -14,10 +14,16 @@
 //! (`PS_CalculateExposure` / `PS_ResetExposure`, a three-vertex draw with a
 //! 1x1 viewport), straight after the draw, so every later reader — the tone
 //! pass `PS_CompositeNMBNoise` samples it — sees the scaled value. The image
-//! holds `x = exp(y)` and `y` = the log of the exposure; the tone pass reads
-//! `y`, so both are moved (`x * f`, `y + ln f`) and `z`/`w` are left as the
-//! title wrote them (they are not exposure: `ResetExposure` carries `w` from
-//! its input and `CalculateExposure` puts another value in `z`).
+//! carries the exposure twice: `x`, and `y` as its log, in a base the title
+//! does not tell (`x` 0.00013 with `y` -12.9 fits neither `exp` nor `exp2`).
+//! The tone pass reads `y`, so the pass scales `x` by the factor and moves
+//! `y` by the factor's natural log. Both land exactly — the read-back trace
+//! shows `x` halving and `y` moving by -0.69315 at factor 0.5 — but whether
+//! that is a factor of 0.5 for a reader of `y` depends on the base, which
+//! this does not answer: `VICTORY_EXPOSURE_READERS` says who reads, and the
+//! picture says whether it is enough. `z` and `w` are left as the title wrote
+//! them: `ResetExposure` carries `w` from its input, and `CalculateExposure`
+//! puts another value in `z`.
 //!
 //! The image is a render target and is created without
 //! `ALLOW_UNORDERED_ACCESS`, so it has no unordered access view
@@ -31,18 +37,22 @@
 //! `VICTORY_EXPOSURE_LOG=1` reads the 1x1 back as floats, copied just before
 //! the scale and just after it, and logs both — the first application and
 //! then one every 60. The dumps cannot answer this: they are 8-bit PNGs, and
-//! the image holds `y = log(exposure)`, so at exposure 1.0 `y` is about 0 and
-//! `x = exp(y)` about 1.0, and the scaled value differs by a single byte in a
-//! format whose scaling we do not know. Decimals are the honest answer.
+//! the exposure moves in the decimals of a float whose encoding into that
+//! byte we do not know. Decimals are the honest answer. A second line every
+//! 60 applications carries `pending`/`logged`, so a trace that is never read
+//! cannot go unnoticed again.
+//!
+//! `VICTORY_EXPOSURE_READERS=1` says which programs name that image in their
+//! views, once per program and per side of the pass — the question the ops
+//! dumps cannot answer, since they hold only hashes and no reader list. A
+//! summary line at the same 60 carries how many distinct programs were seen.
 //!
 //! The read happens at the *next* application, not when the copying list
 //! completes: a `HostList` is moved into `crate::list::Detached` after it is
 //! recorded, so the address it has while recording is not the one it has when
-//! it runs, and a trace keyed by that address is never found again. One line
-//! every 60 applications also carries `pending`/`logged`, so a trace that is
-//! never read cannot go unnoticed again.
+//! it runs, and a trace keyed by that address is never found again.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -92,6 +102,74 @@ pub(crate) fn writes(bytes: &[u8]) -> bool {
 pub(crate) fn logging() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXPOSURE_LOG").is_some_and(|v| v != "0"))
+}
+
+/// Whether `VICTORY_EXPOSURE_READERS` asks which programs name the exposure
+/// image in their views.
+pub(crate) fn readers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXPOSURE_READERS").is_some_and(|v| v != "0"))
+}
+
+/// The exposure image, by its title address, once the pass has seen it.
+static IMAGE: AtomicUsize = AtomicUsize::new(0);
+/// Where the pass last scaled — the list's address while it is recorded
+/// (stable then: the move into `crate::list::Detached` comes later) and the
+/// frame — so a reader can say which side of the pass it read on.
+static SCALED_IN: AtomicUsize = AtomicUsize::new(0);
+static SCALED_FRAME: AtomicU64 = AtomicU64::new(0);
+/// The programs seen naming the image: their description, whether they are
+/// compute, and which side of the pass they read on.
+static SEEN: Mutex<Vec<(String, bool, bool)>> = Mutex::new(Vec::new());
+
+/// `VICTORY_EXPOSURE_READERS`: one of `program`'s views names the exposure
+/// image. Said once per program and per side of the pass.
+pub(crate) fn note_reader(
+    list: &HostList,
+    view: &crate::descriptor::View,
+    program: &str,
+    compute: bool,
+) {
+    let image = IMAGE.load(Ordering::Relaxed);
+    if !readers() || image == 0 {
+        return;
+    }
+    let resource = match view {
+        crate::descriptor::View::Shader(resource, _) => *resource,
+        crate::descriptor::View::Unordered(resource, _, _) => *resource,
+        _ => return,
+    };
+    if resource != image {
+        return;
+    }
+    let scaled = SCALED_IN.load(Ordering::Relaxed) == std::ptr::from_ref(list) as usize
+        && SCALED_FRAME.load(Ordering::Relaxed) == crate::frame::current();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|(seen, seen_compute, seen_scaled)| {
+        seen == program && *seen_compute == compute && *seen_scaled == scaled
+    }) {
+        return;
+    }
+    seen.push((program.to_owned(), compute, scaled));
+    tracing::info!(
+        program,
+        compute,
+        scaled,
+        "exposure reader (VICTORY_EXPOSURE_READERS): a program's views name the exposure image"
+    );
+}
+
+/// How many programs have been seen naming the exposure image.
+fn log_reader_count() {
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut programs: Vec<&str> = seen.iter().map(|(program, ..)| program.as_str()).collect();
+    programs.sort_unstable();
+    programs.dedup();
+    tracing::info!(
+        readers = programs.len(),
+        "exposure readers: {} distinct programs (VICTORY_EXPOSURE_READERS)",
+        programs.len()
+    );
 }
 
 /// Whether application `n` (from 1) is one the trace prints: the first, then
@@ -243,8 +321,10 @@ RWTexture2D<float4> exposure : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
-    // The title keeps x = exp(y); the tone pass reads y. Scaling x and
-    // moving y by its log keeps the two saying the same thing.
+    // The image carries the exposure in x and its log in y; the tone pass
+    // reads y. Scale x by the factor and move y by the factor's natural log
+    // (the trace shows both landing exactly; the base of y is not ours to
+    // assume).
     float4 e = exposure[uint2(0, 0)];
     e.x *= factor;
     e.y += logFactor;
@@ -459,28 +539,43 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
     list.keep(&pass.copy);
     // `VICTORY_EXPOSURE_LOG`: first what the previous application left (its
     // list has run by now), then this application's own trace, copied before
-    // the scale and after it.
+    // the scale and after it. `VICTORY_EXPOSURE_READERS`: where this pass
+    // scaled, so a reader later in the list can say which side it read on.
+    if readers() {
+        IMAGE.store(target as usize, Ordering::Relaxed);
+        SCALED_IN.store(std::ptr::from_ref(list) as usize, Ordering::Relaxed);
+        SCALED_FRAME.store(crate::frame::current(), Ordering::Relaxed);
+    }
     let mut trace: Option<(u64, ID3D12Resource, ID3D12Resource)> = None;
-    if logging() {
-        read_pending();
+    if logging() || readers() {
+        if logging() {
+            read_pending();
+        }
         let n = APPLICATIONS.fetch_add(1, Ordering::Relaxed) + 1;
         if every(n) {
-            log_counts();
-            match (readback(&host.device), readback(&host.device)) {
-                (Ok(before), Ok(after)) => {
-                    list.keep(&before);
-                    list.keep(&after);
-                    trace = Some((n, before, after));
-                }
-                // Without the buffers there is nothing to read: said once,
-                // since `registered` would then stay at zero for ever.
-                _ => {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!(
-                            "no exposure trace (VICTORY_EXPOSURE_LOG): its read-back buffers are not made"
-                        )
-                    });
+            if logging() {
+                log_counts();
+            }
+            if readers() {
+                log_reader_count();
+            }
+            if logging() {
+                match (readback(&host.device), readback(&host.device)) {
+                    (Ok(before), Ok(after)) => {
+                        list.keep(&before);
+                        list.keep(&after);
+                        trace = Some((n, before, after));
+                    }
+                    // Without the buffers there is nothing to read: said
+                    // once, since `registered` would then stay at zero.
+                    _ => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::warn!(
+                                "no exposure trace (VICTORY_EXPOSURE_LOG): its read-back buffers are not made"
+                            )
+                        });
+                    }
                 }
             }
         }
