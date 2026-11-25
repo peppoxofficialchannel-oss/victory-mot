@@ -17,6 +17,22 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// The devices made so far, the default adapter's and WARP's, each made
+/// once and kept until the process ends ([`Host::new`]). The NVIDIA
+/// driver's own threads outlive a device's release: two test sessions on
+/// an RTX 5090 (driver 32.0.16.1742, waves 1 and 3) died in
+/// `nvwgf2umx.dll`+0x719ea6, where a thread of the driver read an object
+/// already freed while the test thread was building its scene on the CPU,
+/// the test before having released its devices (the 32-bit node test over
+/// title memory, whose two runs each make and drop one).
+static DEVICES: std::sync::Mutex<[Option<KeptDevice>; 2]> = std::sync::Mutex::new([None, None]);
+
+/// A device kept in [`DEVICES`].
+struct KeptDevice(ID3D12Device);
+
+// SAFETY: a D3D12 device is free-threaded; it is only cloned from here.
+unsafe impl Send for KeptDevice {}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -63,9 +79,21 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`): the
+    /// same device for every call of a process ([`DEVICES`]).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let mut kept = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(KeptDevice(device)) = &kept[usize::from(warp)] {
+            return Ok(Host { device: device.clone() });
+        }
+        let made = Self::make(warp)?;
+        kept[usize::from(warp)] = Some(KeptDevice(made.device.clone()));
+        Ok(made)
+    }
+
+    /// A new device of the default adapter, or of WARP.
+    fn make(warp: bool) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
