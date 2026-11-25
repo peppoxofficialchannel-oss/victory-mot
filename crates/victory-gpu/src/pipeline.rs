@@ -152,6 +152,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store through a raw address ([`stores_by_address`]):
+    /// only then may it write any copy of title memory by address
+    /// (`crate::memory`), which are then all declared written.
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -210,6 +214,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -220,7 +225,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, stores_by_address })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -417,6 +422,32 @@ pub(crate) fn builder_runs() -> bool {
     );
     b.whole = true;
     true
+}
+
+/// Whether a console program can store through a raw address: a flat or
+/// global store or atomic (not to scratch), or code that is not all known.
+/// Of the structure builder's 52 programs, 23 have flat or global
+/// accesses and 11 of those store or do atomics that way; the others store
+/// through their root views only. Every copy of title memory by address
+/// declared written for any program that can store had the builder's
+/// first frame put back 378 MB of title memory in 7,001 ranges (run
+/// rt-trace1; 67-85 MB a frame of gameplay without the builder, rt-off1).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -951,6 +982,39 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A compute program of `words` then `s_endpgm`.
+    #[cfg(windows)]
+    fn program(words: &[u32]) -> victory_shader::NativeProgram {
+        use victory_shader::native::{ComputeIo, HwStage, StageIo};
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
+        victory_shader::NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [32, 1, 1] }),
+            code,
+        }
+    }
+
+    /// A store through a raw address (global, flat) is one by address; a
+    /// store through a buffer descriptor stores without being one.
+    #[cfg(windows)]
+    #[test]
+    fn stores_by_address_are_flat_and_global_ones() {
+        // global_store_dword v[0:1], v2, off
+        let global = program(&[0xDC70_8000, 0x007D_0200]);
+        // buffer_store_dword v0, v11, s[0:3], 0 offen
+        let buffer = program(&[0xE070_1000, 0x8000_000B]);
+        // global_load_dword v0, v[0:1], off
+        let load = program(&[0xDC30_8000, 0x007D_0000]);
+        assert!(super::stores(&global) && super::stores_by_address(&global));
+        assert!(super::stores(&buffer) && !super::stores_by_address(&buffer));
+        assert!(!super::stores(&load) && !super::stores_by_address(&load));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
