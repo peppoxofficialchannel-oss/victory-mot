@@ -1416,7 +1416,9 @@ pub(crate) fn host_made<'a>(
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// the card's memory into the PC's, which ended runs 20 and 24; with
+/// `VICTORY_TEXTURE_SPILL_MB` such copies are made even then, as long as
+/// the PC's shared pool keeps that many MB free ([`spill_room`]).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1443,9 +1445,53 @@ pub(crate) fn room() -> bool {
         // used.
         Some([budget, used, ..]) => {
             used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+                || spill_room()
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether the card's memory being past its line ([`room`], which says so)
+/// is to be got round by filling the PC's memory shared with the card:
+/// `VICTORY_TEXTURE_SPILL_MB`, how much of that pool's budget stays free
+/// of host copies of the title's textures (unset or 0: never, as before).
+///
+/// An EXPERIMENT, off by default: past its budget the system moves the
+/// card's memory into the PC's, which ended runs 20 and 24. What it buys
+/// is the textures of the shot on screen: when the card stood at 5,632 MB
+/// of a budget of 4,407 (4,933 MB already shared), 8,688 title textures
+/// (7,282 MB of title memory) had no host copy and every pass that could
+/// make one was refused; the surfaces drawn from them kept their flat
+/// material colour, with no texture. Only the queue's own per-frame
+/// budgets bound how fast the shared pool fills; the margin named here
+/// bounds how far.
+#[cfg(windows)]
+fn spill_room() -> bool {
+    static KEPT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(kept) = *KEPT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_SPILL_MB").ok()?;
+        let mb = mb.trim().parse::<u64>().ok().filter(|&mb| mb > 0)?;
+        Some(mb.min(8192) << 20)
+    }) else {
+        return false;
+    };
+    let Some([_, _, shared_budget, shared_used]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return false;
+    };
+    if shared_used.saturating_add(kept) >= shared_budget {
+        return false;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            kept_mb = kept >> 20,
+            shared_used_mb = shared_used >> 20,
+            shared_budget_mb = shared_budget >> 20,
+            "textures are made past the card's line, in the PC's memory shared with it \
+             (VICTORY_TEXTURE_SPILL_MB): an experiment"
+        )
+    });
+    true
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
