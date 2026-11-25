@@ -103,6 +103,7 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+mod split;
 mod threading;
 mod trip;
 #[cfg(windows)]
@@ -580,6 +581,8 @@ fn emit_forms(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // (the exchange form: each host wave on its own instead where that is exact)
+    let original = split::local_if_exact(c, native, p, st, io, res, original);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -641,7 +644,7 @@ fn emit_forms(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again;
+                    return split::local_if_exact(c, native, p, st, io, res, again);
                 }
             }
         }
@@ -690,7 +693,7 @@ fn emit_forms(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again;
+                        return split::local_if_exact(c, native, p, st, io, res, again);
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around

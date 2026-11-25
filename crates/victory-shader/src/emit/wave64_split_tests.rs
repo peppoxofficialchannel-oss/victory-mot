@@ -59,6 +59,12 @@ const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
     [0xE070_1000 | offset, 0x8002_0000 | data << 8 | addr]
 }
 
+/// `buffer_atomic_add v<data>, v<addr>, s[8:11], 0 offen glc`: the old dword returns in
+/// `v<data>`.
+const fn atomic_add(data: u32, addr: u32) -> [u32; 2] {
+    [0xE0C8_5000, 0x8002_0000 | data << 8 | addr]
+}
+
 /// `regs` stored as each thread's dwords of the UAV, the thread's index (v0) times 32 on.
 fn stores(regs: [u32; 8]) -> Vec<u32> {
     let mut w = vec![vop2(0x1A, 15, k(5), 0)]; // v_lshlrev_b32 v15, 5, v0
@@ -137,6 +143,27 @@ fn paired(native: &NativeProgram) -> HostShader {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     shader
+}
+
+/// `native` as [`super::emit`] gives it to a host of 32-lane waves, with the form it took;
+/// validated by `dxil.dll` when present.
+fn chosen(native: &NativeProgram) -> (HostShader, &'static str) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    let form = super::forms::form_of(&shader.dxil);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    (shader, form)
 }
 
 /// `shader` on the hardware device: one group, root constants `s0..s3`, a raw UAV of `dwords`
@@ -263,4 +290,85 @@ fn paired_lanes_read_guarded_writes_as_the_console() {
     let Some(got) = run(&shader, [0; 4], 64 * 8) else { return };
     same_as_console(&got, &want, 8);
     eprintln!("ran on the hardware device: guarded writes read as the console reads them");
+}
+
+/// One console wave of 64 threads, the threads with (37 t & 7) < s0 requesting a slot each, as
+/// the title's light-probe allocation requests do: the first requesting lane counts the
+/// requests (`s_bcnt1`), sums that count over the wave in a whole-wave section (only it holds
+/// one), then reuses the register that held the count (`v_mbcnt_lo`, under its own EXEC), and
+/// reserves the sum with an atomic add on dword 0; every requesting lane takes the base
+/// (`v_readfirstlane_b32`) plus its rank (`v_mbcnt` of the requests) and stores its thread
+/// index there, one dword past the counter.
+///
+/// The allocation idiom ([`super::idiom::wave_local`]), which lets each host wave reserve for
+/// its own half; it was taken as mixing the count into the reused register in the lanes
+/// outside that register's EXEC, which no lane reads (`split::read_inside_only`), and the
+/// program got the exchange form (four group barriers a first-lane read) or the paired form.
+/// Now each host wave on its own: the counter holds the number of requests and each request
+/// is stored once (in an order of the halves' reservations), as on the console.
+#[test]
+fn an_allocation_reusing_its_count_register_takes_each_host_wave_on_its_own() {
+    let sum: Vec<u32> =
+        super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 0x25 << 25 } else { w }).collect();
+    let mut w = Vec::new();
+    w.extend(vop3(0x169, 1, v(0), k(37))); // v_mul_lo_u32 v1, v0, 37
+    w.push(vop2(0x1B, 1, k(7), 1)); // v_and_b32 v1, 7, v1
+    w.push(vopc(0xC4, 0, 1)); // v_cmp_gt_u32 vcc, s0, v1: the requests
+    w.push(sop1(0x24, 12, VCC)); // s_and_saveexec_b64 s[12:13], vcc
+    let skip = w.len();
+    w.push(0); // s_cbranch_execz to the end
+    w.push(sop1(0x04, 14, EXEC)); // s_mov_b64 s[14:15], exec
+    w.extend(vop3(0x365, 3, 14, k(0))); // v_mbcnt_lo_u32_b32 v3, s14, 0
+    w.extend(vop3(0x366, 3, 15, v(3))); // v_mbcnt_hi_u32_b32 v3, s15, v3: the rank
+    w.extend(vop3(0x365, 4, 193, k(0))); // v_mbcnt_lo_u32_b32 v4, -1, 0
+    w.extend(vop3(0x366, 4, 193, v(4))); // v_mbcnt_hi_u32_b32 v4, -1, v4: the lane
+    w.push(sop1(0x14, 16, EXEC)); // s_ff1_i32_b64 s16, exec: the first request
+    w.push(vop1(0x01, 7, k(0))); // v_mov_b32 v7, 0
+    w.push(sop1(0x04, 18, EXEC)); // s_mov_b64 s[18:19], exec
+    w.push(vopc(0x92, 16, 4)); // v_cmpx_eq_i32 exec, s16, v4: its lane
+    let skip2 = w.len();
+    w.push(0); // s_cbranch_execz past the reservation
+    w.push(sop1(0x10, 20, 14)); // s_bcnt1_i32_b64 s20, s[14:15]: the count
+    w.push(vop1(0x01, 7, 20)); // v_mov_b32 v7, s20
+    w.extend(&sum); // the wave's sum of v7 into s7
+    w.extend(vop3(0x365, 7, 193, k(0))); // v_mbcnt_lo_u32_b32 v7, -1, 0: v7 held the count
+    w.extend(vop3(0x366, 9, 193, v(7))); // v_mbcnt_hi_u32_b32 v9, -1, v7
+    w.push(vop1(0x01, 7, 7)); // v_mov_b32 v7, s7
+    w.push(vop1(0x01, 10, k(0))); // v_mov_b32 v10, 0
+    w.extend(atomic_add(7, 10)); // buffer_atomic_add v7, v10, s[8:11], 0 offen glc: the base
+    let join = w.len();
+    w.push(sop1(0x04, EXEC, 18)); // s_mov_b64 exec, s[18:19]: the requests
+    w.push(vop1(0x02, 21, v(7))); // v_readfirstlane_b32 s21, v7
+    w.push(vop2(0x25, 6, 21, 3)); // v_add_nc_u32 v6, s21, v3: the slot
+    w.push(vop2(0x1A, 6, k(2), 6)); // v_lshlrev_b32 v6, 2, v6
+    w.push(vop2(0x25, 6, k(4), 6)); // v_add_nc_u32 v6, 4, v6: past the counter
+    w.extend(store(0, 6, 0)); // buffer_store_dword v0, v6, s[8:11], 0 offen
+    let end = w.len();
+    w.push(sop1(0x04, EXEC, 12)); // s_mov_b64 exec, s[12:13]
+    branch_to(&mut w, skip, 0x08, end);
+    branch_to(&mut w, skip2, 0x08, join);
+    let native = native(&w, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    super::idiom::wave_local(&p, &st).expect("the allocation idiom");
+    let (local, form) = chosen(&native);
+    assert_eq!(form, super::forms::LOCAL, "each host wave on its own");
+    let pairs = paired(&native);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for s0 in [3u32, 8, 1, 0] {
+        let requests: Vec<u32> = (0..64).filter(|&t| ((37 * t) & 7) < s0).collect();
+        for (shader, name) in [(&local, "each host wave on its own"), (&pairs, "paired")] {
+            let Some(got) = run(shader, [s0, 0, 0, 0], 65) else { return };
+            assert_eq!(got[0] as usize, requests.len(), "{name}, s0 {s0}: the counter");
+            let mut stored: Vec<u32> = got[1..=requests.len()].to_vec();
+            if name == "paired" {
+                // one console wave: its own order, the rank's
+                assert_eq!(stored, requests, "{name}, s0 {s0}: in the console's order");
+            }
+            stored.sort_unstable();
+            assert_eq!(stored, requests, "{name}, s0 {s0}: each request once");
+            assert!(got[1 + requests.len()..].iter().all(|&x| x == 0), "{name}, s0 {s0}: nothing past the count");
+        }
+    }
+    eprintln!("ran on the hardware device: the requests reserved by each host wave, each stored once");
 }

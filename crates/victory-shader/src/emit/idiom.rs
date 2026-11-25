@@ -210,6 +210,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         Ok((out, reserved))
     };
     let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
+    // guarded writes whose old lanes no lane reads (`split::read_inside_only`)
+    let inside = if super::split::on() { super::split::read_inside_only(p, st) } else { HashSet::new() };
     let order = crate::ir::reverse_postorder(&p.blocks);
     let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
@@ -284,10 +286,12 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                         }
                         _ => k,
                     };
-                    // a guarded write leaves the old value in the lanes outside EXEC
+                    // a guarded write leaves the old value in the lanes outside EXEC (where a
+                    // lane reads it)
                     if guarded
                         && matches!(r, Reg::V(_))
                         && kw == Wave::Plain
+                        && !inside.contains(&w)
                         && matches!(of(kind, inst.read(r)), Wave::First | Wave::Total(_) | Wave::Prefix)
                     {
                         kw = Wave::Mixed;
