@@ -826,6 +826,24 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        // A source the list's shaders write, in a list whose shaders store
+        // through addresses (the structure builder's): on the card, behind
+        // them (`HostList::copy_on_card`); at submission it would take what
+        // the source held before they ran. Only there: moving every title
+        // copy to the card cost 205 -> 232 ms a frame, its destinations
+        // being small constant buffers the CPU then waited for (README).
+        // `VICTORY_CARD_TITLE_COPIES=0`: always at submission, as before.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TITLE_COPIES").is_none_or(|v| v != "0"));
+        if on
+            && list.asked(crate::memory::STORES)
+            && list.shaders_wrote(from as usize, len as usize)
+            && list.copy_on_card(to as u64, from as u64, len)
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::bvhtrace::line(|| format!("G {:#x}+{len:#x} from {:#x}", to as usize, from as usize));
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
