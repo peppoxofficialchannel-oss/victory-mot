@@ -135,7 +135,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use link::{link_mesh, link_mesh_alone, mesh_fits};
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_max_wave};
+pub use lower::{LIMITS_BARRIER, host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,

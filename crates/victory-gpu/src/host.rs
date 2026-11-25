@@ -440,9 +440,12 @@ fn io_back(total: u64, issue: u64, wait: u64) {
         ms(IO_RELAY[1].swap(0, Ordering::Relaxed)),
     );
     // `relay-hand` sums every reason a submission settles; which one it is
-    // decides the cure, so the same cadence prints them apart. `LATE_WAITED`
-    // is only ever added to, so taking it here costs nothing elsewhere.
-    let waited = |why: usize| LATE_WAITED[why].swap(0, Ordering::Relaxed) as f64 / 1e3;
+    // decides the cure, so the same cadence prints them apart. `LATE_WAITED_IO`
+    // is only ever added to by the same two places that add to `LATE_WAITED`,
+    // and only this line drains it: the frame line drains the other one, and
+    // while both drained the same counter (run `iotest3`) whichever printed
+    // first took the numbers and this line showed a fragment.
+    let waited = |why: usize| LATE_WAITED_IO[why].swap(0, Ordering::Relaxed) as f64 / 1e3;
     tracing::info!(
         "late waits (VICTORY_IO_TIMING): sync={:.1} card-done={:.1} value={:.1} stale={:.1} read={:.1} run={:.1} most={:.1} writes={:.1} fence={:.1} ms; \
          blocked: copy={} fill={} staging={}",
@@ -2659,6 +2662,16 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+/// The same, for the `io timings` line alone. The frame line drains
+/// [`LATE_WAITED`] every cadence, and so did the io line: whichever printed
+/// first took the numbers, so the io line's breakdown was a **fragment** of
+/// the wait (run `iotest3`: `read=119,1` ms there against 594 ms over the run,
+/// and windows with 14.6 s of `relay-hand` and 0,0 ms in every why). Added at
+/// the same two places, drained only by the io line.
+static LATE_WAITED_IO: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -3406,6 +3419,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+    LATE_WAITED_IO[why.min(10)].fetch_add(us, Ordering::Relaxed);
     // `VICTORY_IO_TIMING`: the submitting thread's wait for the relay, the
     // number that says whether the copy back sits on its critical path.
     if io_timing() {
@@ -5518,6 +5532,7 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                LATE_WAITED_IO[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 submission_us(1, gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {

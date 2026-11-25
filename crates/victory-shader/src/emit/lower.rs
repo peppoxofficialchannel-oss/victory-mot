@@ -714,6 +714,13 @@ pub(super) fn thread_limits() -> bool {
 /// console lanes a thread) or that does not give what the console computes anyway.
 pub(super) const LIMITS_INEXACT: Why = "a thread group cut short, in the paired or an approximate form";
 
+/// A program for dispatches by thread counts that reaches a group barrier. The threads past
+/// the counts leave in the entry block ([`Lower::thread_limit_prologue`]), so the barrier below
+/// would be reached by part of the group only: D3D12 leaves that undefined, and the console's
+/// whole group meets it. Refused: such a dispatch runs whole groups, or a stage of the
+/// structure builder turns the builder off.
+pub const LIMITS_BARRIER: Why = "a thread group cut short, with a group barrier";
+
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
 /// each console wave is one host wave of 32 lanes, and host lane n runs console lanes n and
 /// n + 32. The group has half the console's threads; each thread runs what a lane does twice,
@@ -4321,14 +4328,29 @@ impl<'a> Lower<'a> {
     /// tell each other whether they have a launched thread: one with none leaves whole, and its
     /// exchange dword keeps that 0, which is what a half without a lane in EXEC gives every
     /// exchange but a reduction's join ([`Self::partner_live`]).
-    // shortcut: a thread that leaves is taken to stop holding up the group's barriers, as an
-    // exited thread does on NVIDIA's and AMD's GPUs (D3D12 leaves a barrier that some thread
-    // of the group does not reach undefined).
+    /// A program that meets a group barrier is refused ([`LIMITS_BARRIER`]): the threads that
+    /// left never reach it.
+    // shortcut: a thread that leaves is taken to stop holding up the barriers this translation
+    // adds for the exchange of two host waves (and any barrier a block's code leaves out,
+    // `no_barrier`), as an exited thread does on NVIDIA's and AMD's GPUs (D3D12 leaves a barrier
+    // that some thread of the group does not reach undefined).
     fn thread_limit_prologue(&mut self, body: usize) -> Result<(), Why> {
         use super::shader::USER_THREAD_LIMIT;
         let StageIo::Cs(cs) = self.x.native.io else {
             return Err("thread counts outside compute");
         };
+        // The guest's own barriers: a cut-short group's threads past the count return before
+        // any of them, so the group meeting one is not the group D3D12 expects.
+        if self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name() == "s_barrier")
+        {
+            return Err(LIMITS_BARRIER);
+        }
         // (one host thread with two console lanes cannot leave for one of them)
         if self.twin.is_some() {
             return Err(LIMITS_INEXACT);

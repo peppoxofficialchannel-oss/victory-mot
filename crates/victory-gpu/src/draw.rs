@@ -2403,6 +2403,24 @@ impl State {
         let size = size.map(|n| n.max(1));
         let groups: [u32; 3] = std::array::from_fn(|d| threads[d].div_ceil(size[d]));
         let cut = (0..3).any(|d| !threads[d].is_multiple_of(size[d]));
+        // D3D12 accepts at most 65,535 groups along an axis, and a dispatch by
+        // thread counts is the title's request: one past it is refused, not
+        // cut into pieces (before, its x ran as several where the program
+        // counts groups from a base, and as asked where it may not).
+        if groups.iter().any(|&g| g > MOST_GROUPS) {
+            #[cfg(feature = "diagnostics")]
+            {
+                let hash = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .and_then(|p| p.stages.first().map(|s| s.shader.hash.clone()))
+                    .unwrap_or_default();
+                crate::pipeline::note_thread_limit(PAST_GROUPS, &hash);
+            }
+            once!("a dispatch by thread counts past 65,535 groups in a dimension dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        }
         self.limits = cut.then_some(threads);
         self.dispatch(list, groups[0], groups[1], groups[2]);
         self.limits = None;
@@ -3505,6 +3523,11 @@ impl State {
 
 /// The most groups one host dispatch runs in a dimension.
 const MOST_GROUPS: u32 = 65535;
+
+/// Why a dispatch by thread counts was refused (diagnostics): the groups it
+/// asks for along a dimension are past [`MOST_GROUPS`].
+#[cfg(feature = "diagnostics")]
+const PAST_GROUPS: &str = "a dispatch by thread counts past 65,535 groups in a dimension";
 
 /// For a compute pipeline whose program counts its groups in x from a base
 /// the host gives it (`victory_shader::emit::USER_GROUP_BASE`): the root

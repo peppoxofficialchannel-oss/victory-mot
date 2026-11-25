@@ -630,6 +630,36 @@ fn a_dispatch_by_thread_counts_runs_no_thread_past_them() {
     eprintln!("ran: no thread past the counts stored");
 }
 
+/// A group barrier must be met by the whole group, and a group cut short has threads the host
+/// never launches: in D3D12 the barrier those never reach is undefined, so a program that meets
+/// one is refused for dispatches by thread counts ([`lower::LIMITS_BARRIER`]) and still
+/// translates for group counts. Translates only; nothing runs.
+#[test]
+fn a_dispatch_by_thread_counts_refuses_a_group_barrier() {
+    let plain = numbering(false, 32);
+    // the same program, the group meeting a barrier before it stops
+    let mut words: Vec<u32> = plain
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    let end = words.iter().position(|&w| w == 0xBF81_0000).expect("s_endpgm");
+    words.insert(end, 0xBF8A_0000); // s_barrier
+    let barrier = NativeProgram {
+        code: words.into_iter().flat_map(|w| w.to_le_bytes()).collect(),
+        ..plain
+    };
+    let error = lowered_for(&barrier, true).expect_err("a cut-short group meeting a barrier");
+    assert!(
+        matches!(
+            error,
+            crate::ShaderError::Unsupported { what, .. } if what == lower::LIMITS_BARRIER
+        ),
+        "{error}"
+    );
+    lowered_for(&barrier, false).expect("group counts meet the barrier whole");
+}
+
 /// The builder's programs translated for dispatches by thread counts
 /// ([`super::translate_thread_limited`]; the title dispatches its box rehydration, header
 /// copies and triangle reloads so): each translates as it does for group counts, but in the
@@ -649,6 +679,7 @@ fn the_builders_programs_translate_for_dispatches_by_thread_counts() {
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref()).ok();
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let (mut done, mut refused, mut wrong) = (0, 0, Vec::new());
+    let mut barriers = 0;
     // the dwords of the root signature the layer makes (`pipeline/host.rs`): the user data as
     // root constants, root CBVs as root descriptors, the title's root SRVs and UAVs as
     // one-view tables, ours as root descriptors; D3D12 allows 64
@@ -684,12 +715,18 @@ fn the_builders_programs_translate_for_dispatches_by_thread_counts() {
             (Ok(_), Err(crate::ShaderError::Unsupported { what, .. })) if what == lower::LIMITS_INEXACT => {
                 refused += 1;
             }
+            // (a cut-short group that meets a group barrier: D3D12 leaves it undefined, so it
+            // is refused too — the count is what a run's diagnostics line reports)
+            (Ok(_), Err(crate::ShaderError::Unsupported { what, .. })) if what == lower::LIMITS_BARRIER => {
+                refused += 1;
+                barriers += 1;
+            }
             (Ok(_), Err(e)) => wrong.push((k, e.to_string())),
         }
     }
     lower::TEST_HOST_WAVE.set(was);
     eprintln!(
-        "{done} translate for thread counts, {refused} refused (paired or approximate forms); root signatures of {} dwords at most ({} for group counts)",
+        "{done} translate for thread counts, {refused} refused ({barriers} of them for a group barrier, the rest paired or approximate forms); root signatures of {} dwords at most ({} for group counts)",
         most.1, most.0
     );
     assert!(wrong.is_empty(), "{wrong:?}");

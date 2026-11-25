@@ -211,12 +211,20 @@ impl Shader {
                         thread_counts = self.thread_limited,
                         "shader translated"
                     ),
-                    Err(e) if self.thread_limited => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate for dispatches by thread counts; their cut-short groups run whole"
-                    ),
+                    Err(e) if self.thread_limited => {
+                        // (what the run should be asked about: a cut-short group that meets a
+                        // group barrier, which D3D12 leaves undefined)
+                        #[cfg(feature = "diagnostics")]
+                        if e.contains(victory_shader::emit::LIMITS_BARRIER) {
+                            note_thread_limit(victory_shader::emit::LIMITS_BARRIER, &self.hash);
+                        }
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate for dispatches by thread counts; their cut-short groups run whole"
+                        );
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -689,6 +697,61 @@ pub(crate) fn making() -> u64 {
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Dispatches by thread counts that could not run only the threads the title
+/// asked for, since the start: the reason, and the hash of the shader that
+/// met it (diagnostics). Counted once per program where the form that runs
+/// only those threads is refused (`victory_shader::emit::LIMITS_BARRIER` is
+/// such a reason: a cut-short group meeting a group barrier, which D3D12
+/// leaves undefined), and once per dispatch where one is refused outright.
+#[cfg(all(windows, feature = "diagnostics"))]
+static THREAD_LIMITS: Mutex<Option<HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+
+/// Counts one dispatch by thread counts that could not run only the threads
+/// the title asked for (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_thread_limit(reason: &'static str, hash: &str) {
+    let mut limits = THREAD_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    *limits
+        .get_or_insert_with(HashMap::new)
+        .entry((reason, hash.to_owned()))
+        .or_default() += 1;
+}
+
+/// The line [`note_thread_limit`] feeds, for the periodic diagnostics report:
+/// always printed, so that a run where neither case came up says so.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn log_thread_limits() {
+    let limits = THREAD_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rows: Vec<(&'static str, &str, u64)> = limits
+        .iter()
+        .flatten()
+        .map(|((reason, hash), &n)| (*reason, hash.as_str(), n))
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| b.2.cmp(&a.2)));
+    let mut reasons: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for (reason, hash, n) in rows {
+        let named = format!("{hash} {n}x");
+        match reasons.last_mut() {
+            Some((last, hashes)) if *last == reason => hashes.push(named),
+            _ => reasons.push((reason, vec![named])),
+        }
+    }
+    let total: u64 = limits.iter().flatten().map(|(_, n)| *n).sum();
+    let said: Vec<String> = reasons
+        .into_iter()
+        .map(|(reason, hashes)| format!("{reason}: {}", hashes.join(", ")))
+        .collect();
+    tracing::info!(
+        "dispatches by thread counts that could not run only those threads: {total} since the \
+         start ({})",
+        if said.is_empty() {
+            "none".to_owned()
+        } else {
+            said.join("; ")
+        }
+    );
+}
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
