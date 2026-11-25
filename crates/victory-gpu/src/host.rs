@@ -3150,6 +3150,37 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// Title memory `[address, address + len)` is about to show other physical
+/// pages: a queue's page-mapping copy, which the console runs behind the
+/// work sent before it. Flights in the air ([`late`]) whose shaders may
+/// write that memory land first, so what they wrote reaches the pages it
+/// was written to; landed after, it went to the pages mapped in their place
+/// (another resource's, shown at other addresses too).
+/// `VICTORY_REMAP_LAND=0`: as before, the pages are mapped at once.
+pub(crate) fn land_before_remap(address: u64, len: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !late() || len == 0 || !*ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_LAND").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let (from, to) = (address as usize, address.saturating_add(len) as usize);
+    let pending = {
+        let line = line();
+        line.settling || touches(&line.written, from, to)
+    };
+    if !pending {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::bvhtrace::line(|| format!("L {address:#x}+{len:#x} flights land before the pages change"));
+    if relay() {
+        // Only until the flights that may write there have landed (the
+        // landing thread recomputes `written` from those still in the air).
+        relay_wait(WHY_SYNC, |line| !line.settling && !touches(&line.written, from, to));
+    } else {
+        settle_now(WHY_SYNC);
+    }
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);

@@ -1217,6 +1217,24 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // The console maps the pages behind the work sent before: what that
+    // work's shaders write must land in the pages mapped now, not in those
+    // mapped next (the relay lands flights after their submission returns).
+    #[cfg(windows)]
+    for b in batches.into_iter().flatten() {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
+        #[cfg(feature = "diagnostics")]
+        crate::bvhtrace::line(|| {
+            let kinds: Vec<String> = ranges.iter().map(|r| format!("{}:{:#x}+{}", r.kind, r.start, r.count)).collect();
+            format!("P {:#x}+{len:#x} pool {pool:#x} ranges {} [{}]", b.destination, ranges.len(), kinds.join(" "))
+        });
+        crate::host::land_before_remap(b.destination, len);
+    }
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
