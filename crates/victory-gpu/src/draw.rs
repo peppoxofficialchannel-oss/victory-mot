@@ -492,6 +492,16 @@ fn dropped(pipeline: usize) {
     }
 }
 
+/// `VICTORY_BVH_DRY=1` (diagnostics): the structure builder's dispatches
+/// are bound as usual (host copies made ready, shader writes declared) and
+/// then not run, to tell what the builder's own writes do from what the
+/// rest of its machinery does.
+#[cfg(feature = "diagnostics")]
+fn builder_dry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_DRY").is_some_and(|v| v == "1"))
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -2132,6 +2142,82 @@ impl State {
         });
     }
 
+    /// With the builder's trace (`crate::bvhtrace`): a dispatch of the
+    /// structure builder or of another program that reaches title memory by
+    /// address, with its root arguments and the first bytes of title memory
+    /// at each root view.
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline, what: impl FnOnce() -> String) {
+        use std::fmt::Write;
+        if !crate::bvhtrace::on() {
+            return;
+        }
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let by_address = p
+            .stages
+            .iter()
+            .any(|s| s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY));
+        if !builder && !by_address {
+            return;
+        }
+        if builder {
+            crate::bvhtrace::arm();
+            // What a stage reads from list upload memory (the process heap,
+            // past the title's 40 bits), as it stands when the list is
+            // submitted: the builder fills it after recording.
+            let hash = p.stages.first().map_or(String::new(), |s| s.shader.hash.clone());
+            let headers = crate::bvhtrace::header_stage() == Some(hash.as_str());
+            let count = self.compute.iter().find_map(|r| match r {
+                Root::Constants(v) => v.first().copied(),
+                _ => None,
+            });
+            for root in &self.compute {
+                if let Root::View(a) = *root
+                    && a >= 1 << 40
+                {
+                    let hash = hash.clone();
+                    list.defer_host(move || {
+                        crate::bvhtrace::line(|| format!("R {hash} {a:#x} [{}]", crate::bvhtrace::peek(a, 160)));
+                        if headers && let Some(count) = count {
+                            crate::bvhtrace::headers_named(a, count);
+                        }
+                    });
+                }
+            }
+        }
+        crate::bvhtrace::line(|| {
+            let hash = p.stages.first().map_or("?", |s| s.shader.hash.as_str());
+            let mut text = format!(
+                "D {:#x} {} {hash} {}",
+                std::ptr::from_ref(list) as usize,
+                if builder { "B" } else { "M" },
+                what()
+            );
+            for (slot, root) in self.compute.iter().enumerate() {
+                match root {
+                    Root::None => {}
+                    Root::Table(a) => {
+                        let _ = write!(text, " | {slot}=table {a:#x}");
+                    }
+                    Root::Constants(v) => {
+                        let _ = write!(text, " | {slot}=constants {}", crate::bvhtrace::hex(&v.iter().flat_map(|d| d.to_le_bytes()).collect::<Vec<u8>>()));
+                    }
+                    Root::View(a) => {
+                        let _ = write!(text, " | {slot}=view {a:#x}");
+                        match crate::shadow::extent(*a) {
+                            Some((start, len)) => {
+                                let _ = write!(text, " in {start:#x}+{len:#x}");
+                            }
+                            None => text.push_str(" in no buffer"),
+                        }
+                        let _ = write!(text, " [{}]", crate::bvhtrace::peek(*a, 64));
+                    }
+                }
+            }
+            text
+        });
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2186,6 +2272,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.trace_dispatch(list, p, || format!("{x}x{y}x{z}"));
+        #[cfg(feature = "diagnostics")]
+        if builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
+            return;
+        }
         match group_base(p).filter(|_| x > MOST_GROUPS) {
             // More groups in x than one host dispatch runs, for a program
             // that counts them from a base: run as several, each told its
@@ -3251,7 +3343,20 @@ impl State {
         });
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {
+            self.trace_dispatch(list, p, || {
+                format!(
+                    "indirect max {max} at {arguments:#x} [{}] count {:?}",
+                    crate::bvhtrace::peek(arguments, 12),
+                    count.map(|c| crate::bvhtrace::peek(c, 4))
+                )
+            });
             wide_dispatch(p, arguments, stride, max);
+        }
+        #[cfg(feature = "diagnostics")]
+        if builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
+            // (The list knows where the clamp left the records: nothing to
+            // give back when they are not read.)
+            return true;
         }
         if kind == MESH {
             self.mesh_scissor(list, true);

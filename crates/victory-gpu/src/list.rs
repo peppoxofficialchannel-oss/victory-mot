@@ -1356,7 +1356,13 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        #[cfg(feature = "diagnostics")]
+        crate::bvhtrace::line(|| format!("X recorded {dst:#x}+{len:#x} from {src:#x}"));
         list.defer(move || {
+            #[cfg(feature = "diagnostics")]
+            crate::bvhtrace::line(|| {
+                format!("X {dst:#x}+{len:#x} from {src:#x} [{}]", crate::bvhtrace::peek(src, len.min(32)))
+            });
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
