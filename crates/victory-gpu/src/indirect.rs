@@ -1087,7 +1087,9 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                // One group per piece, as `Host::card_before` records it
+                // (`host::dispatch_card_compare`).
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1553,13 +1555,12 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
-        let mut kept = 0usize;
+        let mut kept: Vec<usize> = Vec::new();
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
-                kept += 1;
+                kept.push(i);
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
                 zeroed += 1;
@@ -1569,7 +1570,18 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Two waves, 128 records, 64 a group: the charge is first come,
+        // first served (`SOURCE`'s `costs`/`fits`: each group takes the
+        // budget it finds room for, and D3D12 orders no groups), so the wave
+        // that reaches the budget first takes all of it. The two records
+        // that run are its first two real draws; record 0 is no draw and
+        // charges nothing.
+        assert_eq!(kept.len(), 2, "two draws fit the budget, kept {kept:?}");
+        assert!(
+            kept == [1, 2] || kept == [64, 65],
+            "the first two real draws of the wave that charged first fit the budget, kept {kept:?}"
+        );
+        assert_eq!(zeroed, (RECORDS as usize) - 2);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

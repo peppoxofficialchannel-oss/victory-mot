@@ -1646,8 +1646,24 @@ mod tests {
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
-            // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // Half of it decommitted: turned down, the host not asked. The
+            // host keeps the pages while a placed heap stands over them (the
+            // probe's "decommit inside false"), and the runtime lets that
+            // heap go on its own thread once the work that read the buffer
+            // has finished: the first call after `drop` fails with 87 and
+            // the same call a few milliseconds later succeeds (measured: the
+            // first or second of 5 ms steps; more often under load). What the
+            // test holds to is that the pages do go back, and that a
+            // placement over them is then refused.
+            let mut freed = 0;
+            for _ in 0..200 {
+                freed = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT);
+                if freed != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_ne!(freed, 0, "the pages go back once the placed heap is gone");
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
