@@ -14,14 +14,12 @@
 //! (`PS_CalculateExposure` / `PS_ResetExposure`, a three-vertex draw with a
 //! 1x1 viewport), straight after the draw, so every later reader — the tone
 //! pass `PS_CompositeNMBNoise` samples it — sees the scaled value. The image
-//! carries the exposure twice: `x`, and `y` as its log, in a base the title
-//! does not tell (`x` 0.00013 with `y` -12.9 fits neither `exp` nor `exp2`).
-//! The tone pass reads `y`, so the pass scales `x` by the factor and moves
-//! `y` by the factor's natural log. Both land exactly — the read-back trace
-//! shows `x` halving and `y` moving by -0.69315 at factor 0.5 — but whether
-//! that is a factor of 0.5 for a reader of `y` depends on the base, which
-//! this does not answer: `VICTORY_EXPOSURE_READERS` says who reads, and the
-//! picture says whether it is enough. `z` and `w` are left as the title wrote
+//! carries the exposure twice, `x` and `y` with **`x = 2^y`**: two samples
+//! agree to five decimals (`y` -1.3 with `x` 0.40613; `y` -12.9 with `x`
+//! 0.00013, where 2^-1.3 = 0.406126). The tone pass reads `y`, so the pass
+//! scales `x` by the factor and moves `y` by its log **base 2**, which keeps
+//! `x = 2^y` true: at factor 0.5 the read-back trace shows `x` halving and
+//! `y` moving by exactly -1.00000. `z` and `w` are left as the title wrote
 //! them: `ResetExposure` carries `w` from its input, and `CalculateExposure`
 //! puts another value in `z`.
 //!
@@ -111,66 +109,19 @@ pub(crate) fn readers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXPOSURE_READERS").is_some_and(|v| v != "0"))
 }
 
-/// The exposure image, by its title address, once the pass has seen it.
+/// The exposure image, by its title address, once a program that writes it
+/// has drawn it.
 static IMAGE: AtomicUsize = AtomicUsize::new(0);
-/// Where the pass last scaled — the list's address while it is recorded
-/// (stable then: the move into `crate::list::Detached` comes later) and the
-/// frame — so a reader can say which side of the pass it read on.
-static SCALED_IN: AtomicUsize = AtomicUsize::new(0);
-static SCALED_FRAME: AtomicU64 = AtomicU64::new(0);
+/// The frame the pass last recorded in: `u64::MAX` before any, so no frame
+/// is taken for one it scaled.
+static SCALED_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The programs seen naming the image: their description, whether they are
-/// compute, and which side of the pass they read on.
-static SEEN: Mutex<Vec<(String, bool, bool)>> = Mutex::new(Vec::new());
+/// compute, which side of the pass they read on, and whether they also write
+/// it.
+static SEEN: Mutex<Vec<(String, bool, bool, bool)>> = Mutex::new(Vec::new());
 
-/// `VICTORY_EXPOSURE_READERS`: one of `program`'s views names the exposure
-/// image. Said once per program and per side of the pass.
-pub(crate) fn note_reader(
-    list: &HostList,
-    view: &crate::descriptor::View,
-    program: &str,
-    compute: bool,
-) {
-    let image = IMAGE.load(Ordering::Relaxed);
-    if !readers() || image == 0 {
-        return;
-    }
-    let resource = match view {
-        crate::descriptor::View::Shader(resource, _) => *resource,
-        crate::descriptor::View::Unordered(resource, _, _) => *resource,
-        _ => return,
-    };
-    if resource != image {
-        return;
-    }
-    let scaled = SCALED_IN.load(Ordering::Relaxed) == std::ptr::from_ref(list) as usize
-        && SCALED_FRAME.load(Ordering::Relaxed) == crate::frame::current();
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.iter().any(|(seen, seen_compute, seen_scaled)| {
-        seen == program && *seen_compute == compute && *seen_scaled == scaled
-    }) {
-        return;
-    }
-    seen.push((program.to_owned(), compute, scaled));
-    tracing::info!(
-        program,
-        compute,
-        scaled,
-        "exposure reader (VICTORY_EXPOSURE_READERS): a program's views name the exposure image"
-    );
-}
-
-/// How many programs have been seen naming the exposure image.
-fn log_reader_count() {
-    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let mut programs: Vec<&str> = seen.iter().map(|(program, ..)| program.as_str()).collect();
-    programs.sort_unstable();
-    programs.dedup();
-    tracing::info!(
-        readers = programs.len(),
-        "exposure readers: {} distinct programs (VICTORY_EXPOSURE_READERS)",
-        programs.len()
-    );
-}
+/// The host state a texture a shader samples needs (pixel and not).
+const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
 /// Whether application `n` (from 1) is one the trace prints: the first, then
 /// one every 60.
@@ -321,10 +272,10 @@ RWTexture2D<float4> exposure : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
-    // The image carries the exposure in x and its log in y; the tone pass
-    // reads y. Scale x by the factor and move y by the factor's natural log
-    // (the trace shows both landing exactly; the base of y is not ours to
-    // assume).
+    // The image carries the exposure in x and its log base 2 in y (x = 2^y);
+    // the tone pass reads y. Scale x by the factor and move y by its log2,
+    // which keeps the two in step (the trace shows x halving and y -1.00000
+    // at factor 0.5).
     float4 e = exposure[uint2(0, 0)];
     e.x *= factor;
     e.y += logFactor;
@@ -476,13 +427,88 @@ fn subresource(texture: &ID3D12Resource) -> D3D12_TEXTURE_COPY_LOCATION {
     }
 }
 
-/// Scales by `VICTORY_EXPOSURE_SCALE` what the exposure program just drew
-/// into `target`, in `list`. Whether it recorded anything.
+/// Keeps the exposure image, by title address, for the reader scan and for
+/// the pass: the program that writes it names it in `draw`.
+pub(crate) fn note_image(target: This) {
+    IMAGE.store(target as usize, Ordering::Relaxed);
+}
+
+/// Whether one of a program's views names the exposure image.
+pub(crate) fn names_image(view: &crate::descriptor::View) -> bool {
+    let image = IMAGE.load(Ordering::Relaxed);
+    if image == 0 {
+        return false;
+    }
+    match view {
+        crate::descriptor::View::Shader(resource, _) => *resource == image,
+        crate::descriptor::View::Unordered(resource, _, _) => *resource == image,
+        _ => false,
+    }
+}
+
+/// Whether the pass has already been recorded in this frame.
+pub(crate) fn scaled_this_frame() -> bool {
+    SCALED_FRAME.load(Ordering::Relaxed) == crate::frame::current()
+}
+
+/// `VICTORY_EXPOSURE_READERS`: `program` names the exposure image in its
+/// views. Said once per program, per `compute`, per `writes` and per side of
+/// the pass — a program seen both before and after it is printed twice,
+/// which is the answer.
+pub(crate) fn log_reader(program: &str, compute: bool, scaled: bool, writes: bool) {
+    if !readers() || IMAGE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen
+        .iter()
+        .any(|(seen, seen_compute, seen_scaled, seen_writes)| {
+            seen == program
+                && *seen_compute == compute
+                && *seen_scaled == scaled
+                && *seen_writes == writes
+        })
+    {
+        return;
+    }
+    seen.push((program.to_owned(), compute, scaled, writes));
+    tracing::info!(
+        program,
+        compute,
+        scaled,
+        writes,
+        "exposure reader (VICTORY_EXPOSURE_READERS): a program's views name the exposure image"
+    );
+}
+
+/// How many programs have been seen naming the exposure image.
+fn log_reader_count() {
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut programs: Vec<&str> = seen.iter().map(|(program, ..)| program.as_str()).collect();
+    programs.sort_unstable();
+    programs.dedup();
+    tracing::info!(
+        readers = programs.len(),
+        "exposure readers: {} distinct programs (VICTORY_EXPOSURE_READERS)",
+        programs.len()
+    );
+}
+
+/// The log the image's `y` is moved by: the image keeps `x = 2^y`, so base 2
+/// (a natural log would move `y` by less than the factor asks: -0.6931
+/// instead of -1 at 0.5, which scales `x` by 0.619, not 0.5).
+fn log_of(factor: f32) -> f32 {
+    factor.log2()
+}
+
+/// Scales by `VICTORY_EXPOSURE_SCALE` the exposure image, in `list`, just
+/// before the draw whose views read it. Whether it recorded anything.
 ///
-/// The copy of ours is left in the common state; every run records the same
-/// barriers, and lists run in submission order, so a list can assume it
-/// common at its start without tracking it.
-pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
+/// The image is left a shader resource: the draw that asked for the copy is
+/// about to sample it. The copy of ours is left in the common state; every
+/// run records the same barriers, and lists run in submission order, so a
+/// list can assume it common at its start without tracking it.
+pub(crate) fn scale_image(list: &HostList) -> bool {
     let (Some(factor), Some(host)) = (scale(), host()) else {
         return false;
     };
@@ -490,7 +516,11 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
     if factor == 1.0 {
         return false;
     }
-    let Some(exposure) = crate::resource::host_resource(target) else {
+    let image = IMAGE.load(Ordering::Relaxed);
+    if image == 0 {
+        return false;
+    }
+    let Some(exposure) = crate::resource::host_resource(image as This) else {
         return false;
     };
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -539,13 +569,7 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
     list.keep(&pass.copy);
     // `VICTORY_EXPOSURE_LOG`: first what the previous application left (its
     // list has run by now), then this application's own trace, copied before
-    // the scale and after it. `VICTORY_EXPOSURE_READERS`: where this pass
-    // scaled, so a reader later in the list can say which side it read on.
-    if readers() {
-        IMAGE.store(target as usize, Ordering::Relaxed);
-        SCALED_IN.store(std::ptr::from_ref(list) as usize, Ordering::Relaxed);
-        SCALED_FRAME.store(crate::frame::current(), Ordering::Relaxed);
-    }
+    // the scale and after it.
     let mut trace: Option<(u64, ID3D12Resource, ID3D12Resource)> = None;
     if logging() || readers() {
         if logging() {
@@ -580,8 +604,13 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
             }
         }
     }
-    // The target the draw just wrote, put where the copy reads it.
-    crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    // The image, put where the copy reads it (the reader that asked for the
+    // pass has already had it a shader resource, `readable`).
+    crate::list::ensure_state(
+        list,
+        image as This,
+        D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+    );
     // SAFETY: an open list and live resources; our image is common at the
     // start of every recording and left so at its end.
     unsafe {
@@ -626,7 +655,8 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        let constants = [factor, factor.ln(), 0.0f32, 0.0];
+        // Base 2: the image keeps `x = 2^y`, and the tone pass reads `y`.
+        let constants = [factor, log_of(factor), 0.0f32, 0.0];
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, pass.views.GetGPUDescriptorHandleForHeapStart());
         l.Dispatch(1, 1, 1);
@@ -642,8 +672,8 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
             l.CopyTextureRegion(&placed(after), 0, 0, 0, &subresource(&pass.copy), None);
         }
     }
-    crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
-    // SAFETY: as above; the scaled image goes back into the target.
+    crate::list::ensure_state(list, image as This, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+    // SAFETY: as above; the scaled image goes back into it.
     unsafe {
         l.CopyTextureRegion(
             &subresource(exposure),
@@ -654,15 +684,15 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
             None,
         );
     }
-    // Back to the state the title left the target in, for whatever reads it
-    // next (the tone pass reads it as a shader resource).
-    crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+    // A shader resource, for the draw this pass runs before.
+    crate::list::ensure_state(list, image as This, SHADER_RESOURCE);
     barrier(
         l,
         &pass.copy,
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COMMON,
     );
+    SCALED_FRAME.store(crate::frame::current(), Ordering::Relaxed);
     if let Some((n, before, after)) = trace {
         PENDING
             .lock()
@@ -724,6 +754,17 @@ mod tests {
             b"....PS_CompositeNMBNoise_97148495_Wrapped\0"
         ));
         assert!(!super::writes(b""));
+    }
+
+    /// The log moved is base 2: the image keeps `x = 2^y`, and at 0.5 the
+    /// move is exactly -1 (a natural log would give -0.6931, and `x` would
+    /// land at 0.619 of its value, not 0.5).
+    #[test]
+    fn the_log_of_the_factor_is_base_two() {
+        assert_eq!(super::log_of(0.5), -1.0);
+        assert_eq!(super::log_of(0.25), -2.0);
+        assert_eq!(super::log_of(4.0), 2.0);
+        assert_eq!(super::log_of(1.0), 0.0);
     }
 
     /// The pass compiles with the system's compiler and the host takes it.
