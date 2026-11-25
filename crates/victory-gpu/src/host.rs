@@ -409,6 +409,12 @@ fn copy_back_off() -> bool {
 /// made; the read-backs' own maps (`read_backs`) are the bottom-of-pipe
 /// copies that run after this span and the frame line does not count them.
 /// The rest of `total` is the compare and the merge.
+///
+/// With the relay (`VICTORY_RELAY`) the span is recorded on the relay's
+/// thread, so `issue`/`wait` are 0 for it: that thread's own occupancy
+/// (`relay-work`) and what the submitting thread waited for it
+/// (`relay-hand`) are the two numbers that say whether the copy back is work
+/// or a wait.
 fn io_back(total: u64, issue: u64, wait: u64) {
     if !io_timing() {
         return;
@@ -426,15 +432,21 @@ fn io_back(total: u64, issue: u64, wait: u64) {
     let ms = |us: u64| us as f64 / 1e3;
     tracing::info!(
         frame,
-        "io timings (VICTORY_IO_TIMING): frame={frame} issue={:.1} fence-wait={:.1} map=n/a total={:.1} ms",
+        "io timings (VICTORY_IO_TIMING): frame={frame} issue={:.1} fence-wait={:.1} map=n/a total={:.1} ms relay-hand={:.1} relay-work={:.1}",
         ms(IO_US[0].swap(0, Ordering::Relaxed)),
         ms(IO_US[1].swap(0, Ordering::Relaxed)),
         ms(IO_US[2].swap(0, Ordering::Relaxed)),
+        ms(IO_RELAY[0].swap(0, Ordering::Relaxed)),
+        ms(IO_RELAY[1].swap(0, Ordering::Relaxed)),
     );
 }
 
 /// `VICTORY_IO_TIMING`'s sums since the last line: issue, wait, total (µs).
 static IO_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// The relay's two sides since the last line (µs): what the submitting
+/// thread waited for it (`relay_wait`), and what it spent landing
+/// (`relay_worker`).
+static IO_RELAY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 static IO_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Adds to [`CARD_CLOCK_US`] and, for the card's idle times, to the frame
@@ -3372,6 +3384,11 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+    // `VICTORY_IO_TIMING`: the submitting thread's wait for the relay, the
+    // number that says whether the copy back sits on its critical path.
+    if io_timing() {
+        IO_RELAY[0].fetch_add(us, Ordering::Relaxed);
+    }
     submission_us(1, us);
 }
 
@@ -3443,7 +3460,15 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                // `VICTORY_IO_TIMING`: what this thread spends landing them,
+                // from taking them to having them done.
+                let started = io_timing().then(std::time::Instant::now);
+                host.relay_land(items, &mut fetch);
+                if let Some(started) = started {
+                    IO_RELAY[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
