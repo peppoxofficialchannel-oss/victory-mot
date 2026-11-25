@@ -71,6 +71,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its range of the loop notes (`crate::loop_notes`), given out on its
+    /// first draw.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) loop_slot: OnceLock<u32>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -132,6 +136,8 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(windows)]
             walks: OnceLock::new(),
+            #[cfg(all(windows, feature = "diagnostics"))]
+            loop_slot: OnceLock::new(),
         }
     }
 }

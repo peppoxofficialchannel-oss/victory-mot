@@ -51,6 +51,21 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// The root UAV `u<SLOT_LOOPS>` in [`ROOT_CBV_SPACE`] of a program translated
+/// with loop notes (`super::loop_notes`, diagnostics builds only): a raw
+/// buffer of [`LOOP_NOTES`] dwords of the program's own (the host binds each
+/// program its own range) where lanes that reached a loop's iteration limit
+/// are counted. [`LOOP_NOTE_DWORDS`] dwords per counted loop, in the order of
+/// their first code byte (any loop past the last shares the last record):
+/// that byte plus 1; the lanes that left the loop at the limit and went on
+/// with the program; the lanes the limit took out of the program (a pixel
+/// discarded, a vertex, mesh or compute lane stopped); a spare dword. A
+/// helper lane of a pixel shader writes nothing, so it is never counted.
+pub const SLOT_LOOPS: u8 = 251;
+/// Dwords of one program's [`SLOT_LOOPS`] range.
+pub const LOOP_NOTES: u32 = 64;
+/// Dwords of one loop's record in a [`SLOT_LOOPS`] range.
+pub const LOOP_NOTE_DWORDS: u32 = 4;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

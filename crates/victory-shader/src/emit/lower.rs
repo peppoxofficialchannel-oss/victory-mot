@@ -312,6 +312,9 @@ struct Lower<'a> {
     traces: bool,
     /// The block a loop stopped by its limit leaves the program from.
     abort: Option<usize>,
+    /// With loop notes ([`super::loop_notes`]): each counted loop's number in
+    /// its program's notes (`shader::SLOT_LOOPS`), by header IR block.
+    notes: Option<HashMap<usize, u32>>,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -347,6 +350,22 @@ struct LaneState {
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     strides: HashMap<(usize, Site, u8), V>,
     clane: Option<V>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: loop notes on this thread whatever [`super::loop_notes`] says.
+    pub(super) static TEST_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this translation counts the lanes that reach a loop's limit
+/// ([`super::loop_notes`]).
+fn notes_on() -> bool {
+    #[cfg(test)]
+    if TEST_NOTES.get() {
+        return true;
+    }
+    super::loop_notes()
 }
 
 /// Iterations after which a loop of a program that tests rays against tree
@@ -1438,6 +1457,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            notes: None,
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -2168,6 +2188,14 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if notes_on() {
+            // Numbered by their first code byte, which the host logs too.
+            let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+            headers.sort_by_key(|&h| (p.blocks[h].offset, h));
+            let last = super::shader::LOOP_NOTES / super::shader::LOOP_NOTE_DWORDS - 1;
+            let numbered = headers.into_iter().enumerate().map(|(n, h)| (h, (n as u32).min(last)));
+            self.notes = Some(numbered.collect());
         }
         self.cur = self.s.entry;
         // Title memory written by address has no rasterizer-ordered form.
@@ -10682,7 +10710,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let mut abort = self.abort_block();
+                if self.notes.is_some() {
+                    abort = self.note_block(t, true, abort);
+                }
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -10728,6 +10759,7 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                let wanted = cond;
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
@@ -10739,14 +10771,31 @@ impl<'a> Lower<'a> {
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+                // With loop notes, the exit of a counted back edge passes a
+                // block that counts the lanes leaving at the limit.
+                let header = [taken, not_taken].into_iter().find(|&h| back(self, h));
+                let noted = match header {
+                    Some(h) if self.notes.is_some() && h == taken => {
+                        let (x, pred) = self.note_exit(b, not_taken, f, h, wanted, true);
+                        f = x;
+                        Some((not_taken, pred))
+                    }
+                    Some(h) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, taken, t, h, wanted, false);
+                        t = x;
+                        Some((taken, pred))
+                    }
+                    _ => None,
+                };
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
+                        // From an edge block, or from here (or from the
+                        // block after a note).
+                        let from = match noted {
+                            Some((n, pred)) if n == to => pred,
+                            _ if Some(via) == self.block[to] => self.cur,
+                            _ => via,
                         };
                         self.enter_loop(b, to, from);
                     }
@@ -10834,6 +10883,58 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
         a
+    }
+
+    /// With loop notes ([`super::loop_notes`]): a new block that counts a lane
+    /// that reached loop `header`'s iteration limit in the program's notes
+    /// (`shader::SLOT_LOOPS`; `killed`: the lane leaves the program, else it
+    /// leaves the loop and goes on), then branches to `then`.
+    fn note_block(&mut self, header: usize, killed: bool, then: usize) -> usize {
+        use super::shader::{LOOP_NOTE_DWORDS, LOOP_NOTES, SLOT_LOOPS};
+        let last = LOOP_NOTES / LOOP_NOTE_DWORDS - 1;
+        let k = self.notes.as_ref().and_then(|n| n.get(&header)).copied().unwrap_or(last);
+        let n = self.s.m.new_block();
+        let h = self.s.root_uav_handle(SLOT_LOOPS);
+        let (i32t, void) = (self.s.t.i32, self.s.t.void);
+        let iu = self.s.m.undef(i32t);
+        let record = k * LOOP_NOTE_DWORDS * 4;
+        // The loop's first code byte plus 1 (0: no record), then the count.
+        let (at, first) = (self.s.m.i32(record), self.s.m.i32(self.x.p.blocks[header].offset as u32 + 1));
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        self.s
+            .op(n, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, at, iu, first, iu, iu, iu, mask, align]);
+        let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let count = self.s.m.i32(record + if killed { 8 } else { 4 });
+        self.s
+            .op(n, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, add, count, iu, iu, one]);
+        self.s.m.terminate(n, Term::Br(then));
+        n
+    }
+
+    /// With loop notes: the exit edge of IR block `b`'s branch to `to` (DXIL
+    /// block `via`), whose other edge goes back to the counted `header`, made
+    /// to pass a test of `wanted` (the branch's own condition, before the
+    /// limit) that counts the lanes leaving at the limit ([`Self::note_block`]):
+    /// those that wanted to take the back edge when it is the branch's taken
+    /// side (`back_taken`), those that did not otherwise. The block the branch
+    /// now goes to, and the one `to` is now entered from.
+    fn note_exit(&mut self, b: usize, to: usize, via: usize, header: usize, wanted: V, back_taken: bool) -> (usize, usize) {
+        let (test, join) = (self.s.m.new_block(), self.s.m.new_block());
+        let note = self.note_block(header, false, join);
+        let term = if back_taken {
+            Term::CondBr(wanted, note, join)
+        } else {
+            Term::CondBr(wanted, join, note)
+        };
+        self.s.m.terminate(test, term);
+        self.s.m.terminate(join, Term::Br(via));
+        if Some(via) == self.block[to] {
+            // `to`'s joins take this edge's values from here on.
+            self.edges.insert((b, to), join);
+            (test, join)
+        } else {
+            (test, via)
+        }
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
