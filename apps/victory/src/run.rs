@@ -43,6 +43,13 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // The title's own levers (`VICTORY_NO_WATCHDOG`, `VICTORY_OWN_UPSCALER`,
+    // `VICTORY_RENDER_SCALE`): off unless the environment asks, and each one
+    // checks the bytes it replaces, so a different build changes nothing.
+    let patched = victory_loader::resolution_levers(image.base());
+    if patched > 0 {
+        println!("hooks          {patched} patches applied");
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
