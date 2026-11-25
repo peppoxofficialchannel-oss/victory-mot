@@ -29,12 +29,20 @@
 //! exposure stays. Without the factor the pass records nothing at all.
 //!
 //! `VICTORY_EXPOSURE_LOG=1` reads the 1x1 back as floats, copied just before
-//! the scale and just after it, and logs both once every 60 applications
-//! (and on the first): the dumps cannot show this, since they are 8-bit
-//! PNGs where `x = exp(y)` is 2.72 at exposure 1.0 and 1.36 at 0.5, and both
-//! clip to 255.
+//! the scale and just after it, and logs both — the first application and
+//! then one every 60. The dumps cannot answer this: they are 8-bit PNGs, and
+//! the image holds `y = log(exposure)`, so at exposure 1.0 `y` is about 0 and
+//! `x = exp(y)` about 1.0, and the scaled value differs by a single byte in a
+//! format whose scaling we do not know. Decimals are the honest answer.
+//!
+//! The read happens at the *next* application, not when the copying list
+//! completes: a `HostList` is moved into `crate::list::Detached` after it is
+//! recorded, so the address it has while recording is not the one it has when
+//! it runs, and a trace keyed by that address is never found again. One line
+//! every 60 applications also carries `pending`/`logged`, so a trace that is
+//! never read cannot go unnoticed again.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -92,12 +100,9 @@ fn every(n: u64) -> bool {
     n == 1 || n % 60 == 0
 }
 
-/// The 1x1 as it was before the scale and after it, waiting for the list
-/// that copied them to have run.
-struct Logged {
-    /// The list that recorded the copies, by address: only that list's
-    /// completion reads them.
-    list: usize,
+/// The 1x1 as it was before the scale and after it, kept until the
+/// application after it has read them.
+struct Trace {
     before: ID3D12Resource,
     after: ID3D12Resource,
     factor: f32,
@@ -105,10 +110,18 @@ struct Logged {
     frame: u64,
 }
 
-/// Read-backs waiting for their list to have run, and how many there are
-/// (the check every completed list makes, without taking the lock).
-static LOGGED: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
-static WAITING: AtomicUsize = AtomicUsize::new(0);
+/// Traces its list has not been read from yet, and two counters: how many
+/// were registered and how many were read (`pending` is the difference, and
+/// stays above zero if a trace is never read).
+///
+/// The list a trace comes from is not named here: a `HostList` is moved after
+/// it is recorded, into `crate::list::Detached { host }`, so the address it
+/// had while recording is not the one it has when it runs. The trace is read
+/// at the start of the next application instead, whose recording happens
+/// after that list was submitted.
+static PENDING: Mutex<Vec<Trace>> = Mutex::new(Vec::new());
+static REGISTERED: AtomicU64 = AtomicU64::new(0);
+static LOGGED: AtomicU64 = AtomicU64::new(0);
 
 /// How many times the scale has been recorded (frames, when the exposure is
 /// drawn once a frame).
@@ -187,33 +200,40 @@ fn read(buffer: &ID3D12Resource) -> [f32; 4] {
     out
 }
 
-/// After `list` has run (`crate::host::read_backs`): what its trace copied
-/// before and after the scale, logged. Lists with no trace leave at once.
-pub(crate) fn log_read_backs(list: &HostList) {
-    if WAITING.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let me = std::ptr::from_ref(list) as usize;
-    let mut waiting = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-    waiting.retain(|logged| {
-        if logged.list != me {
-            return true;
-        }
-        WAITING.fetch_sub(1, Ordering::Relaxed);
-        let before = read(&logged.before);
-        let after = read(&logged.after);
+/// Reads the traces the previous applications left, and logs them. Runs at
+/// the start of an application: the list that copied them was submitted a
+/// frame earlier, and the buffers are made fresh for each trace, so nothing
+/// is being written into them now.
+fn read_pending() {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    for trace in pending.drain(..) {
+        let before = read(&trace.before);
+        let after = read(&trace.after);
+        LOGGED.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
-            factor = logged.factor,
-            n = logged.n,
-            frame = logged.frame,
+            factor = trace.factor,
+            n = trace.n,
+            frame = trace.frame,
             "exposure x/y before -> after (VICTORY_EXPOSURE_LOG): {:.5}/{:.5} -> {:.5}/{:.5}",
             before[0],
             before[1],
             after[0],
             after[1]
         );
-        false
-    });
+    }
+}
+
+/// The two counters, and how many traces are still waiting to be read.
+fn log_counts() {
+    let registered = REGISTERED.load(Ordering::Relaxed);
+    let logged = LOGGED.load(Ordering::Relaxed);
+    let pending = registered.saturating_sub(logged);
+    tracing::info!(
+        registered,
+        "exposure trace pending={} logged={}",
+        pending,
+        logged
+    );
 }
 
 const SOURCE: &str = r#"
@@ -437,17 +457,32 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
     });
     let l = &list.list;
     list.keep(&pass.copy);
-    // `VICTORY_EXPOSURE_LOG`: the 1x1 copied before the scale and after it,
-    // read once this list has run (`log_read_backs`).
+    // `VICTORY_EXPOSURE_LOG`: first what the previous application left (its
+    // list has run by now), then this application's own trace, copied before
+    // the scale and after it.
     let mut trace: Option<(u64, ID3D12Resource, ID3D12Resource)> = None;
     if logging() {
+        read_pending();
         let n = APPLICATIONS.fetch_add(1, Ordering::Relaxed) + 1;
-        if every(n)
-            && let (Ok(before), Ok(after)) = (readback(&host.device), readback(&host.device))
-        {
-            list.keep(&before);
-            list.keep(&after);
-            trace = Some((n, before, after));
+        if every(n) {
+            log_counts();
+            match (readback(&host.device), readback(&host.device)) {
+                (Ok(before), Ok(after)) => {
+                    list.keep(&before);
+                    list.keep(&after);
+                    trace = Some((n, before, after));
+                }
+                // Without the buffers there is nothing to read: said once,
+                // since `registered` would then stay at zero for ever.
+                _ => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(
+                            "no exposure trace (VICTORY_EXPOSURE_LOG): its read-back buffers are not made"
+                        )
+                    });
+                }
+            }
         }
     }
     // The target the draw just wrote, put where the copy reads it.
@@ -534,18 +569,17 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
         D3D12_RESOURCE_STATE_COMMON,
     );
     if let Some((n, before, after)) = trace {
-        LOGGED
+        PENDING
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(Logged {
-                list: std::ptr::from_ref(list) as usize,
+            .push(Trace {
                 before,
                 after,
                 factor,
                 n,
                 frame: crate::frame::current(),
             });
-        WAITING.fetch_add(1, Ordering::Relaxed);
+        REGISTERED.fetch_add(1, Ordering::Relaxed);
     }
     true
 }
