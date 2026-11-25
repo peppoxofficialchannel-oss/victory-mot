@@ -307,6 +307,9 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`PIXEL_LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loops whose code fixes how often they go round again
+    /// (`trip::constant_passes`), by header IR block.
+    passes: HashMap<usize, u32>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
@@ -393,7 +396,7 @@ pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
 /// GPU until the driver resets it. A lane that reaches the limit where the
 /// loop branches back on a condition leaves the loop and goes on with the
 /// program; one where it jumps back leaves the program as killed (a pixel
-/// discards).
+/// discards). A loop whose code fixes its count (`trip`) runs it all.
 // shortcut: a genuine loop of more iterations than the limit is cut short too.
 pub(super) const PIXEL_LOOP_LIMIT: u32 = 1 << 7;
 /// The same for vertex and mesh programs.
@@ -1460,6 +1463,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            passes: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             notes: None,
@@ -2194,6 +2198,9 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                if let Some(n) = super::trip::constant_passes(p, &self.rpo, b) {
+                    self.passes.insert(b, n);
+                }
             }
         }
         if notes_on() {
@@ -10892,6 +10899,17 @@ impl<'a> Lower<'a> {
             limits.trace
         } else {
             limits.compute
+        };
+        // A loop whose code fixes how often it goes round runs that often, as
+        // on the console, whatever the data: the limit is for loops the data
+        // ends. (The title's environment BRDF tables integrate 1,024 samples a
+        // texel, two or four a pass: at the pixel limit of 128 passes each of
+        // the 65,536 texels of the three tables stopped at a half or a quarter
+        // of its samples, in all six loops, counted with `VICTORY_LOOP_NOTES=1`
+        // in the opening cutscene.)
+        let limit = match self.passes.get(&to) {
+            Some(&n) => limit.max(n.saturating_add(1)),
+            None => limit,
         };
         let limit = self.s.m.i32(limit);
         self.counters

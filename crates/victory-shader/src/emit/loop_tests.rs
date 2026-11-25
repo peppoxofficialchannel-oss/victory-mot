@@ -130,6 +130,25 @@ fn a_loop_that_ends_leaves_no_note() {
     }
 }
 
+#[test]
+fn a_loop_whose_code_fixes_its_count_runs_to_its_end_past_the_limit() {
+    // s6 counts from 0 while it differs from 5,000 (a literal): more passes
+    // than the compute limit, all of them the console's.
+    let body = [
+        s_mov_b32(6, 0x80),
+        S_ADD_S6_1,
+        0xBF07_FF06, // s_cmp_lg_u32 s6, lit(5000)
+        5000,
+        0xBF85_FFFC, // s_cbranch_scc1 (back to the s_add)
+        vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
+    ];
+    assert!(5000 > COMPUTE_LOOP_LIMIT);
+    for (label, stored, notes) in run(&body) {
+        assert_eq!(stored, 5000, "{label}");
+        assert!(notes.iter().all(|&w| w == 0), "{label}: {notes:?}");
+    }
+}
+
 /// A signature element of four floats in row 0.
 fn element(name: &str, kind: u8, interp: u8, usage: u8) -> SigElement {
     SigElement {

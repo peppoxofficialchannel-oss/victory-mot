@@ -103,6 +103,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+mod trip;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -128,8 +129,9 @@ pub use shader::{
     USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
-/// The iteration counts after which a translated loop is left, per lane
-/// and per entry into the loop, by stage.
+/// The iteration counts after which a translated loop whose end the data
+/// decides is left, per lane and per entry into the loop, by stage (a loop
+/// whose code fixes its count runs to its end: `trip`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopLimits {
     pub pixel: u32,
