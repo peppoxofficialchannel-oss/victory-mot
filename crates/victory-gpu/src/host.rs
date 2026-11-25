@@ -444,7 +444,8 @@ fn io_back(total: u64, issue: u64, wait: u64) {
     // is only ever added to, so taking it here costs nothing elsewhere.
     let waited = |why: usize| LATE_WAITED[why].swap(0, Ordering::Relaxed) as f64 / 1e3;
     tracing::info!(
-        "late waits (VICTORY_IO_TIMING): sync={:.1} card-done={:.1} value={:.1} stale={:.1} read={:.1} run={:.1} most={:.1} writes={:.1} fence={:.1} ms",
+        "late waits (VICTORY_IO_TIMING): sync={:.1} card-done={:.1} value={:.1} stale={:.1} read={:.1} run={:.1} most={:.1} writes={:.1} fence={:.1} ms; \
+         blocked: copy={} fill={} staging={}",
         waited(WHY_SYNC),
         waited(WHY_CARD_DONE),
         waited(WHY_VALUE),
@@ -454,6 +455,11 @@ fn io_back(total: u64, issue: u64, wait: u64) {
         waited(WHY_MOST),
         waited(WHY_WRITES),
         waited(WHY_FENCE),
+        // What `read` is made of: `Step::Copy` into a range in flight (the
+        // one direction `fill_ahead` does not cover), fills, stagings.
+        LATE_STATS[15].swap(0, Ordering::Relaxed),
+        LATE_STATS[16].swap(0, Ordering::Relaxed),
+        LATE_STATS[17].swap(0, Ordering::Relaxed),
     );
 }
 
