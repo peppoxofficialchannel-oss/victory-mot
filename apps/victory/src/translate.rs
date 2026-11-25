@@ -69,6 +69,9 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Mesh programs whose outputs pass D3D12's 32 KiB alone, checked as linked for a
+    /// pipeline whose pixel program reads none of them (`emit::link_mesh_alone`).
+    ms_linked: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +133,7 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.ms_linked += other.ms_linked;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -358,8 +362,9 @@ pub fn run(
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
     );
     println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+        "             {} emitted of {} mesh programs; {} validated, {} pipelines \
+         ({} of them over 32 KiB alone, checked as linked without the outputs no pixel program reads)",
+        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines, t.ms_linked
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -676,7 +681,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, &bytes, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -689,7 +694,14 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    bytes: &[u8],
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -757,7 +769,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, bytes, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -824,9 +836,10 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let _ = lock(out).write_all(line.as_bytes());
 }
 
-/// Validates an emitted shader if asked to.
+/// Validates an emitted shader if asked to (`container`: the console's, as translated).
 fn check(
     mut shader: emit::HostShader,
+    container: &[u8],
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
@@ -846,6 +859,17 @@ fn check(
             format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
             &shader.dxil,
         );
+    }
+    // A mesh program whose outputs pass D3D12's 32 KiB as translated alone never gets a
+    // pipeline as it is: the runtime links it with its pixel program, or leaves out every
+    // output only a pixel program would read when there is none (`emit::link_mesh_alone`).
+    // The stub pixel program below reads none of them, so that is the form checked here.
+    if shader.stage == HwStage::Ms
+        && !emit::mesh_fits(&shader.dxil).unwrap_or(true)
+        && let Ok(Some(linked)) = emit::link_mesh_alone(container, &shader)
+    {
+        t.ms_linked += 1;
+        shader = linked;
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {

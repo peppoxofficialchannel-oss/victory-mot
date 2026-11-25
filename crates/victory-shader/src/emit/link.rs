@@ -17,7 +17,9 @@
 //! elements kept keep their rows and columns, each program its code and bindings. Measured
 //! offline (`victory translate` with `VICTORY_PAIRS`): the ten pixel programs that read most
 //! for each of the 71, and the three pairs drawn in the runs so far, all link, validate and
-//! get a pipeline on an RTX 5090.
+//! get a pipeline on an RTX 5090. A pipeline without a pixel program (the title draws depth
+//! with mesh programs alone) gets the mesh program with its system values only
+//! ([`link_mesh_alone`]), which is also what the offline census validates for the 71.
 
 use super::container::{MESH_OUTPUT_LIMIT, SigElement, mesh_output_bytes};
 use super::{HostShader, translate};
@@ -83,29 +85,16 @@ pub fn link_mesh(
     if ms.stage != HwStage::Ms || ps.stage != HwStage::Ps || mesh_fits(&ms.dxil)? {
         return Ok(None);
     }
-    let named = |e: &Element| (e.name.clone(), e.index);
     let inputs = elements(&ps.dxil, FourCC::ISG1)?;
     let read = |e: &Element| {
         inputs
             .iter()
             .any(|i| i.arbitrary() && i.used != 0 && i.name.eq_ignore_ascii_case(&e.name) && i.index == e.index)
     };
-    let outputs: Vec<(String, u32)> = elements(&ms.dxil, FourCC::OSG1)?
-        .iter()
-        .filter(|e| e.arbitrary() && !read(e))
-        .map(named)
-        .collect();
-    if outputs.is_empty() {
+    let Some(linked_ms) = mesh_without(ms_container, ms, read)? else {
         return Ok(None);
-    }
+    };
     let unread: Vec<(String, u32)> = inputs.iter().filter(|i| i.arbitrary() && i.used == 0).map(named).collect();
-    let linked_ms = with_linked(
-        Linked {
-            inputs: Vec::new(),
-            outputs,
-        },
-        || translate(ms_container),
-    )?;
     let linked_ps = if unread.is_empty() {
         ps.clone()
     } else {
@@ -117,11 +106,62 @@ pub fn link_mesh(
             || translate(ps_container),
         )?
     };
-    let same = |a: &HostShader, b: &HostShader| HostShader { dxil: Vec::new(), ..a.clone() } == HostShader { dxil: Vec::new(), ..b.clone() };
-    if !mesh_fits(&linked_ms.dxil)? || !same(ms, &linked_ms) || !same(ps, &linked_ps) {
+    if !same(ps, &linked_ps) {
         return Ok(None);
     }
     Ok(Some((linked_ms, linked_ps)))
+}
+
+/// The translation of the mesh program `ms` (container `ms_container`) for a pipeline without a
+/// pixel program, when its outputs pass D3D12's 32 KiB as translated alone: its system values
+/// (position, clip and cull distances) and none of its other outputs, which only a pixel
+/// program would read. The title draws depth with mesh programs alone (143 of them in the runs
+/// so far); this keeps such a pipeline of one of the 71 valid too.
+///
+/// `None` (make the pipeline of `ms` as it is) as for [`link_mesh`]: when `ms` fits, has no
+/// output to leave out, still does not fit, or binds anything differently linked.
+pub fn link_mesh_alone(ms_container: &[u8], ms: &HostShader) -> Result<Option<HostShader>, ShaderError> {
+    if ms.stage != HwStage::Ms || mesh_fits(&ms.dxil)? {
+        return Ok(None);
+    }
+    mesh_without(ms_container, ms, |_| false)
+}
+
+/// `ms` translated again without its outputs of arbitrary semantics that `read` does not
+/// keep; `None` when it leaves none out, or the result does not fit or binds differently.
+fn mesh_without(
+    ms_container: &[u8],
+    ms: &HostShader,
+    read: impl Fn(&Element) -> bool,
+) -> Result<Option<HostShader>, ShaderError> {
+    let outputs: Vec<(String, u32)> = elements(&ms.dxil, FourCC::OSG1)?
+        .iter()
+        .filter(|e| e.arbitrary() && !read(e))
+        .map(named)
+        .collect();
+    if outputs.is_empty() {
+        return Ok(None);
+    }
+    let linked = with_linked(
+        Linked {
+            inputs: Vec::new(),
+            outputs,
+        },
+        || translate(ms_container),
+    )?;
+    if !mesh_fits(&linked.dxil)? || !same(ms, &linked) {
+        return Ok(None);
+    }
+    Ok(Some(linked))
+}
+
+fn named(e: &Element) -> (String, u32) {
+    (e.name.clone(), e.index)
+}
+
+/// Whether two translations of one program bind the same (all but their code).
+fn same(a: &HostShader, b: &HostShader) -> bool {
+    HostShader { dxil: Vec::new(), ..a.clone() } == HostShader { dxil: Vec::new(), ..b.clone() }
 }
 
 /// Whether an emitted mesh program's outputs fit D3D12's 32 KiB (a program of another stage
