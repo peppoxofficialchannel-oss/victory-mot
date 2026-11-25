@@ -3352,7 +3352,8 @@ fn split_signature(root: &ID3D12RootSignature, param: u32, offset: u32) -> Optio
 /// then.
 #[cfg(feature = "diagnostics")]
 fn wide_dispatch(p: &HostPipeline, arguments: u64, stride: u32, max: u32) {
-    let most = if group_base(p).is_some() { MOST_GROUPS * crate::indirect::SPLIT } else { MOST_GROUPS };
+    let split = group_base(p).is_some();
+    let most = if split { MOST_GROUPS * crate::indirect::SPLIT } else { MOST_GROUPS };
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     for i in 0..u64::from(max.clamp(1, 4)) {
         let at = arguments + i * u64::from(stride);
@@ -3362,18 +3363,26 @@ fn wide_dispatch(p: &HostPipeline, arguments: u64, stride: u32, max: u32) {
         // SAFETY: 12 committed bytes of title memory.
         let g = unsafe { (at as *const [u32; 3]).read_unaligned() };
         // Not the garbage of a slot nothing wrote (the clamp's own test).
-        if g[0] <= most || g[0] > 1 << 24 || g[1] > 64 || g[2] > 64 {
+        if g[0] <= MOST_GROUPS || g[0] > 1 << 24 || g[1] > 64 || g[2] > 64 {
             continue;
         }
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if seen.len() < 64 && !seen.contains(&p.name) {
             seen.push(p.name.clone());
-            tracing::warn!(
-                pipeline = %p.name,
-                groups = ?g,
-                most,
-                "an indirect dispatch asks for more groups in x than run: the clamp cuts it and the rest do not run"
-            );
+            if g[0] > most {
+                tracing::warn!(
+                    pipeline = %p.name,
+                    groups = ?g,
+                    most,
+                    "an indirect dispatch asks for more groups in x than run: the clamp cuts it and the rest do not run"
+                );
+            } else {
+                tracing::info!(
+                    pipeline = %p.name,
+                    groups = ?g,
+                    "an indirect dispatch asks for more groups in x than one host dispatch runs: run as several"
+                );
+            }
         }
         return;
     }
