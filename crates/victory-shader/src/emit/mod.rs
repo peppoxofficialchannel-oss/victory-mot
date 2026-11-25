@@ -90,6 +90,8 @@
 //!   their inputs and outputs ([`crate::geometry`], `rings.rs`).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod builder_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
