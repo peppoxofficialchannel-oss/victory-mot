@@ -431,7 +431,7 @@ const CS_CASES: &[(&str, &str)] = &[
     ),
     // A loop whose count comes from a view that reads zeros (as a null or
     // not yet mirrored one does) runs four billion times on the console;
-    // the translation leaves it after `LOOP_LIMIT` iterations. Run on WARP
+    // the translation leaves it at the compute limit. Run on WARP
     // only (`VICTORY_WARP=1`), ours only: without the limit it would hang
     // the GPU.
     (

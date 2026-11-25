@@ -84,9 +84,11 @@ pub(crate) fn counts() -> (u64, u64) {
 /// wave size is never filed under the later key.
 fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    let limit = victory_shader::emit::loop_limit();
-    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
+    let limits = victory_shader::emit::loop_limits();
+    if limits != victory_shader::emit::DEFAULT_LOOP_LIMITS {
+        WARNED.call_once(|| {
+            tracing::warn!(?limits, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop elsewhere")
+        });
     }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {

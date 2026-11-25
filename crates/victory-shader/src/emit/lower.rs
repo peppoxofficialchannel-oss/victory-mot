@@ -304,13 +304,13 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
+    /// Loop headers' iteration counters (see [`PIXEL_LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
+    /// The block a loop stopped by its limit leaves the program from.
     abort: Option<usize>,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
@@ -349,17 +349,8 @@ struct LaneState {
     clane: Option<V>,
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
-
 /// Iterations after which a loop of a program that tests rays against tree
-/// nodes is left, unless [`super::loop_limit`] names a limit for all.
+/// nodes is left, unless [`super::loop_limits`] says otherwise.
 ///
 /// A ray's walk of a well-formed tree visits some hundreds of nodes at
 /// most. The title's shadow-mask rays ran to the compute limit of 4,096: the
@@ -369,6 +360,22 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 /// runs of the opening of the gameplay, RTX 5090); a ray stopped either way
 /// leaves the program as killed, as before.
 pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
+
+/// Iterations after which a loop of a pixel program whose end the data
+/// decides is left (per entry into it), unless [`super::loop_limits`] says
+/// otherwise ([`Lower::count_iteration`]). The console runs such a loop as
+/// long as its data says; data the host has not mirrored yet (a null view
+/// reads zeros) can make that four billion iterations, which hangs the host
+/// GPU until the driver resets it. A lane that reaches the limit where the
+/// loop branches back on a condition leaves the loop and goes on with the
+/// program; one where it jumps back leaves the program as killed (a pixel
+/// discards).
+// shortcut: a genuine loop of more iterations than the limit is cut short too.
+pub(super) const PIXEL_LOOP_LIMIT: u32 = 1 << 7;
+/// The same for vertex and mesh programs.
+pub(super) const VERTEX_LOOP_LIMIT: u32 = 1 << 8;
+/// The same for compute programs that test no rays ([`TRACE_LOOP_LIMIT`]).
+pub(super) const COMPUTE_LOOP_LIMIT: u32 = 1 << 12;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -2150,7 +2157,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`PIXEL_LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -10773,7 +10780,7 @@ impl<'a> Lower<'a> {
 
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
+    /// the stage's limit by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
@@ -10792,12 +10799,15 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
+        let limits = super::loop_limits();
+        let limit = if self.s.pixel {
+            limits.pixel
+        } else if self.s.mesh.is_some() || self.s.threads.is_none() {
+            limits.vertex
+        } else if self.traces {
+            limits.trace
+        } else {
+            limits.compute
         };
         let limit = self.s.m.i32(limit);
         self.counters
@@ -10810,7 +10820,7 @@ impl<'a> Lower<'a> {
         over
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
+    /// The block a lane stopped by its loop's limit leaves through.
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
             return a;
