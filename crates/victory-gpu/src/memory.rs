@@ -281,22 +281,6 @@ fn title_addresses(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn title_addresses_are_found_in_geometry_records() {
-        // A geometry description as the builder copies it into upload memory
-        // (48 bytes): no transform, index and vertex formats, counts, the
-        // index buffer, the vertex buffer and its stride.
-        let mut record = Vec::new();
-        for v in [0u64, 0x10_0000_0035, 0x508_0000_1263, 0xb_13f6_53a0, 0xb_13f0_8bc0, 8] {
-            record.extend_from_slice(&v.to_le_bytes());
-        }
-        let found: Vec<u64> = super::title_addresses(&record).collect();
-        assert_eq!(found, [0xb_13f6_53a0, 0xb_13f0_8bc0]);
-    }
-}
-
 /// `VICTORY_MEMORY_ALL=1`: every list that runs a shader reaching title
 /// memory by address brings every numbered copy up to date and, if the
 /// shader can store through an address, declares every one written, as
@@ -460,4 +444,20 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn title_addresses_are_found_in_geometry_records() {
+        // A geometry description as the builder copies it into upload memory
+        // (48 bytes): no transform, index and vertex formats, counts, the
+        // index buffer, the vertex buffer and its stride.
+        let mut record = Vec::new();
+        for v in [0u64, 0x10_0000_0035, 0x508_0000_1263, 0xb_13f6_53a0, 0xb_13f0_8bc0, 8] {
+            record.extend_from_slice(&v.to_le_bytes());
+        }
+        let found: Vec<u64> = super::title_addresses(&record).collect();
+        assert_eq!(found, [0xb_13f6_53a0, 0xb_13f0_8bc0]);
+    }
 }

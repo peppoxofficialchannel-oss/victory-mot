@@ -622,7 +622,7 @@ fn a_dispatch_by_thread_counts_runs_no_thread_past_them() {
             let whole = run(plain);
             let n = threads as usize;
             assert_eq!(whole[..n], want[..n], "the plain form, inside the count");
-            if threads % group != 0 {
+            if !threads.is_multiple_of(group) {
                 assert_ne!(whole[n], 0, "the plain form runs the whole last group");
             }
         }

@@ -2396,7 +2396,7 @@ impl State {
         };
         let size = size.map(|n| n.max(1));
         let groups: [u32; 3] = std::array::from_fn(|d| threads[d].div_ceil(size[d]));
-        let cut = (0..3).any(|d| threads[d] % size[d] != 0);
+        let cut = (0..3).any(|d| !threads[d].is_multiple_of(size[d]));
         self.limits = cut.then_some(threads);
         self.dispatch(list, groups[0], groups[1], groups[2]);
         self.limits = None;
