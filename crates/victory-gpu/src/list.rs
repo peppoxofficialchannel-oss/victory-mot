@@ -1398,17 +1398,34 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with the console's dispatch
+/// initiator bits (`COMPUTE_DISPATCH_INITIATOR`). The ray-tracing structure
+/// builder dispatches this way, its rehydration of pre-built structures with
+/// [`THREAD_DIMENSIONS`]; the wave32 bit (0x8000) and the others mean nothing
+/// to the host.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & THREAD_DIMENSIONS != 0 {
+        state::dispatch_threads(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
+
+/// The dispatch initiator's `USE_THREAD_DIMENSIONS`: `x`, `y` and `z` count
+/// threads, not groups. The last group along a dimension is cut short and
+/// no thread past the count is launched. Taken for group counts, the
+/// builder's box rehydration (one node per thread, group `g` writing its 64
+/// nodes at `g` times 8 KiB) ran 64 times its groups and wrote megabytes of
+/// empty nodes past each structure it rebuilt in place, over the title's
+/// objects that share those pages (run rt-int1: the title died one frame
+/// later on child pointers of all ones and infinite bounds).
+const THREAD_DIMENSIONS: u32 = 0x20;
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
@@ -1856,6 +1873,11 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    /// A dispatch of `x` by `y` by `z` threads ([`super::THREAD_DIMENSIONS`]).
+    pub(super) fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_threads(list, [x, y, z]));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.

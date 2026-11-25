@@ -170,6 +170,45 @@ fn target() -> [u32; 2] {
     ]
 }
 
+/// The translation of a console compute program for dispatches by thread
+/// counts whose last groups are cut short
+/// (`victory_shader::emit::translate_thread_limited`), from the cache when
+/// there is one, under a key of its own.
+pub(crate) fn host_shader_thread_limited(container: &[u8]) -> Result<HostShader, String> {
+    let container = canonical_container(container);
+    let mut result = None;
+    for _ in 0..2 {
+        let expected = target();
+        let build = build();
+        let (translated, _status) = match CACHE.get() {
+            Some(cache) => cached_for(
+                cache,
+                &build,
+                expected,
+                THREAD_COUNTS,
+                container,
+                victory_shader::emit::translate_thread_limited,
+                || target() == expected,
+            ),
+            None => (
+                victory_shader::emit::translate_thread_limited(container).map_err(|e| e.to_string()),
+                CacheStatus::Unstored,
+            ),
+        };
+        result = Some(translated);
+        if target() == expected {
+            break;
+        }
+    }
+    result.unwrap_or_else(|| {
+        Err("host shader capabilities changed during translation".to_owned())
+    })
+}
+
+/// A cache key's share for a translation of the same container another way
+/// ([`host_shader_thread_limited`]).
+const THREAD_COUNTS: &[u8] = b"thread counts\0";
+
 /// DXBC's declared size excludes trailing allocation padding. Keep the title's
 /// original bytes for pipeline identity, but use this slice for translation.
 fn canonical_container(bytes: &[u8]) -> &[u8] {
@@ -217,7 +256,14 @@ fn lookup(cache: &Cache, container: &[u8]) -> (Translation, CacheStatus) {
     (Err(error.clone()), CacheStatus::Failed(error))
 }
 
-fn shader_key(build: &[u8; 32], [wave, view_limit]: [u32; 2], container: &[u8]) -> CacheKey {
+#[cfg(test)]
+fn shader_key(build: &[u8; 32], target: [u32; 2], container: &[u8]) -> CacheKey {
+    shader_key_for(build, target, b"", container)
+}
+
+/// [`shader_key`] with `variant` folded in, for a translation of the same
+/// container another way ([`host_shader_thread_limited`]).
+fn shader_key_for(build: &[u8; 32], [wave, view_limit]: [u32; 2], variant: &[u8], container: &[u8]) -> CacheKey {
     // Bump the format version if the serialized HostShader or refusal changes.
     CacheKey::from_parts(
         "shader.dxil",
@@ -226,6 +272,7 @@ fn shader_key(build: &[u8; 32], [wave, view_limit]: [u32; 2], container: &[u8]) 
             build,
             &wave.to_le_bytes(),
             &view_limit.to_le_bytes(),
+            variant,
             container,
         ],
     )
@@ -239,7 +286,22 @@ fn cached(
     translate: impl FnOnce(&[u8]) -> Result<HostShader, ShaderError>,
     still_current: impl FnOnce() -> bool,
 ) -> (Translation, CacheStatus) {
-    let key = shader_key(build, target, container);
+    cached_for(cache, build, target, b"", container, translate, still_current)
+}
+
+/// [`cached`] with `variant` folded into the key, for a translation of the
+/// same container another way ([`host_shader_thread_limited`]).
+#[allow(clippy::too_many_arguments)]
+fn cached_for(
+    cache: &Cache,
+    build: &[u8; 32],
+    target: [u32; 2],
+    variant: &[u8],
+    container: &[u8],
+    translate: impl FnOnce(&[u8]) -> Result<HostShader, ShaderError>,
+    still_current: impl FnOnce() -> bool,
+) -> (Translation, CacheStatus) {
+    let key = shader_key_for(build, target, variant, container);
     let path = cache.path_for(&key);
     let read = || {
         std::fs::read(&path)

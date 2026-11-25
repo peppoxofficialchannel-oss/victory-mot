@@ -286,6 +286,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// While a dispatch by thread counts whose last groups are cut short is
+    /// bound and run ([`State::dispatch_threads`]): the counts.
+    limits: Option<[u32; 3]>,
 }
 
 impl Drop for State {
@@ -830,9 +833,13 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_THREAD_LIMIT {
+            // (no counts: every thread of every group runs)
+            return self.limits.map_or(u32::MAX, |l| l[dword.min(2) as usize]);
         }
         // A dispatch starts at group 0; one split into several sets each
         // part's first group itself (`dispatch`, `execute_indirect`).
@@ -2264,6 +2271,23 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // A dispatch by thread counts whose last groups are cut short: the
+        // program's form in which only the threads inside the counts run
+        // (`dispatch_threads`); whole groups if it has none, but for the
+        // structure builder, whose stages rebuild trees in place and run all
+        // or none.
+        let p = match self.limits {
+            Some(_) => match crate::pipeline::thread_limited_pipeline(self.pipeline as This) {
+                Some(limited) => limited,
+                None if crate::pipeline::is_builder(self.pipeline as This) => {
+                    crate::pipeline::builder_off("a stage dispatched by thread counts has no form that runs only those threads");
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                None => p,
+            },
+            None => p,
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2274,9 +2298,11 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        let threads = self.limits.map_or_else(String::new, |[a, b, c]| format!(" threads {a}x{b}x{c}"));
         #[cfg(feature = "diagnostics")]
-        self.trace_dispatch(list, p, || format!("{x}x{y}x{z}"));
+        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}{threads}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.trace_dispatch(list, p, || format!("{x}x{y}x{z}{threads}"));
         #[cfg(feature = "diagnostics")]
         if builder_dry() && crate::pipeline::is_builder(self.pipeline as This) {
             return;
@@ -2337,6 +2363,30 @@ impl State {
             return false;
         }
         crate::ambient::replace(list, light as This)
+    }
+
+    /// A dispatch by thread counts (`DispatchX` with the console's
+    /// `USE_THREAD_DIMENSIONS`, `crate::list`): the groups that hold
+    /// `threads`, of the size the console runs the program's groups at.
+    /// Where the last group along a dimension is cut short, the program runs
+    /// in its form for that ([`crate::pipeline::thread_limited_pipeline`]),
+    /// given the counts: the threads past them leave at once, as the console
+    /// launches none of them.
+    pub(crate) fn dispatch_threads(&mut self, list: &HostList, threads: [u32; 3]) {
+        let Some(size) = crate::pipeline::group_size(self.pipeline as This) else {
+            once!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "a dispatch by thread counts without a compute program's group size: run as group counts"
+            );
+            self.dispatch(list, threads[0], threads[1], threads[2]);
+            return;
+        };
+        let size = size.map(|n| n.max(1));
+        let groups: [u32; 3] = std::array::from_fn(|d| threads[d].div_ceil(size[d]));
+        let cut = (0..3).any(|d| threads[d] % size[d] != 0);
+        self.limits = cut.then_some(threads);
+        self.dispatch(list, groups[0], groups[1], groups[2]);
+        self.limits = None;
     }
 
     /// What a draw or dispatch runs, for the device-removed report

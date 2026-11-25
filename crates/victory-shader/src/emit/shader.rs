@@ -103,6 +103,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// Not asked by programs with a spilled user-data table (their root
 /// signature is close to the host's 64 dwords).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a compute program translated for dispatches by thread counts
+/// ([`super::translate_thread_limited`]): dword `d` (0 to 2) is the number
+/// of threads the title dispatched along x, y or z (asked only along a
+/// dimension whose groups are more than one thread wide). The console's
+/// `DispatchX` with `USE_THREAD_DIMENSIONS` counts threads, not groups: the
+/// last group along a dimension is cut short, and the threads past the
+/// count are not launched (their lanes are outside EXEC from the start,
+/// and a wave with none is not launched at all).
+pub const USER_THREAD_LIMIT: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

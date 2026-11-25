@@ -140,8 +140,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
     SLOT_FAULTS, SLOT_LOOPS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES,
-    USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The iteration counts after which a translated loop whose end the data
@@ -415,6 +415,18 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// [`translate`] of a compute program for dispatches by thread counts whose last group is
+/// cut short (the console's `DispatchX` with `USE_THREAD_DIMENSIONS`): the host runs whole
+/// groups, and the threads past the counts it gives ([`USER_THREAD_LIMIT`]) leave before the
+/// program, as the console never launches them. Where the program's lanes depend on each
+/// other, they count only the launched ones (a wave operation, the lanes in EXEC read as a
+/// number), as on the console. Refused for a form in which a host thread runs two console
+/// lanes (the paired form) and for the approximate forms: the plain translation stays the
+/// answer there.
+pub fn translate_thread_limited(container: &[u8]) -> Result<HostShader, ShaderError> {
+    lower::with_thread_limits(|| translate(container))
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
@@ -544,8 +556,12 @@ fn emit_any(
                 Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
             }
         }
-        if let Ok((shader, _)) = again {
-            return Ok(shader);
+        match again {
+            Ok((shader, _)) => return Ok(shader),
+            // (for dispatches by thread counts the paired form is refused, and with it the
+            // program: the plain translation, in that form, is the answer)
+            Err(e) if lower::thread_limits() => return Err(e),
+            Err(_) => {}
         }
     }
     r.map(|(shader, _)| shader)
@@ -679,6 +695,15 @@ fn emit_forms(
         // last for it (`emit_any`). (`VICTORY_WAVE_PAIRS=0` turns the paired form off here
         // too.)
         let exactly = |approximate: Result<(HostShader, Option<u32>), ShaderError>| {
+            // Threads past a dispatch's thread counts (`translate_thread_limited`) leave at the
+            // start, which the paired form cannot do for one of a thread's two lanes: no form
+            // here would be the plain translation's.
+            if lower::thread_limits() {
+                return Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: lower::LIMITS_INEXACT,
+                });
+            }
             if pairs_on() {
                 let again = paired(c, native, p, io, res);
                 report("paired lanes, before an approximate form", &again);

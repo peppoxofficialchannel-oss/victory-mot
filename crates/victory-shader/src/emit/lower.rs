@@ -303,6 +303,10 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`, in a program for dispatches by thread counts ([`with_thread_limits`]):
+    /// whether the other host wave of this thread's console wave has a launched thread (made
+    /// in the entry block). One that has none has left, and its exchange dword holds 0.
+    partner_live: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -689,7 +693,28 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_paired_lanes`].
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_thread_limits`].
+    static THREAD_LIMITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Runs `f` with compute programs lowered for dispatches by thread counts
+/// (`super::translate_thread_limited`): the threads past the counts the host gives
+/// (`USER_THREAD_LIMIT`) leave before the program ([`Lower::thread_limit_prologue`]).
+pub(super) fn with_thread_limits<R>(f: impl FnOnce() -> R) -> R {
+    let was = THREAD_LIMITS.replace(true);
+    let r = f();
+    THREAD_LIMITS.set(was);
+    r
+}
+
+/// Whether compute programs are lowered for dispatches by thread counts ([`with_thread_limits`]).
+pub(super) fn thread_limits() -> bool {
+    THREAD_LIMITS.get()
+}
+
+/// A program for dispatches by thread counts in a form where threads cannot leave alone (two
+/// console lanes a thread) or that does not give what the console computes anyway.
+pub(super) const LIMITS_INEXACT: Why = "a thread group cut short, in the paired or an approximate form";
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
 /// each console wave is one host wave of 32 lanes, and host lane n runs console lanes n and
@@ -1353,6 +1378,7 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            partner_live: None,
             halves,
             wave_base: None,
             flat: None,
@@ -1806,7 +1832,13 @@ impl<'a> Lower<'a> {
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
                     let (lo, hi) = (back(self, lo), back(self, hi));
-                    self.join_halves(op, lo, hi, float)
+                    let joined = self.join_halves(op, lo, hi, float);
+                    // (a half none of whose threads was launched has left, its dword holding
+                    // 0, which is no identity of AND, MIN or MAX: this half's result alone)
+                    match self.partner_live {
+                        Some(partner) => self.s.m.select(self.cur, partner, joined, r),
+                        None => joined,
+                    }
                 }
             }
         } else {
@@ -2003,7 +2035,12 @@ impl<'a> Lower<'a> {
         } else {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
-        if !every {
+        // (in a dispatch by thread counts some lanes may never have been launched: the tree
+        // would read lanes that left)
+        if thread_limits() && halves {
+            return Err(LIMITS_INEXACT);
+        }
+        if !every || thread_limits() {
             if halves {
                 need(self.cur_ir);
                 return Err(WHERE);
@@ -2119,6 +2156,15 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        // For dispatches by thread counts (`with_thread_limits`): the entry block lets only the
+        // launched threads into the program, which starts in a block of its own.
+        let limited = (thread_limits() && matches!(self.x.native.io, StageIo::Cs(_))).then(|| {
+            let body = self.s.m.new_block();
+            if let Some(&first) = order.first() {
+                self.block[first] = Some(body);
+            }
+            body
+        });
         // Loop headers count iterations (`PIXEL_LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -2170,6 +2216,9 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        }
+        if let Some(body) = limited {
+            self.thread_limit_prologue(body).map_err(|w| unsupported(0, w))?;
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -2374,19 +2423,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => {
-                let id = self.compute_id("groupId.i32", 94, c);
-                // In x, counted from the group the host starts this
-                // dispatch at (`shader.rs` `USER_GROUP_BASE`): the host runs
-                // a dispatch of more groups than it allows as several.
-                if c != 0 || self.user_first() != 0 {
-                    return id;
-                }
-                let Val::I32(g) = id else { unreachable!() };
-                use super::shader::USER_GROUP_BASE;
-                let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
-                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
-            }
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2449,6 +2486,20 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Component `c` of the console's group id: in x, counted from the group the host starts
+    /// this dispatch at (`shader.rs` `USER_GROUP_BASE`): the host runs a dispatch of more
+    /// groups than it allows as several.
+    fn group_id(&mut self, c: u8) -> Val {
+        let id = self.compute_id("groupId.i32", 94, c);
+        if c != 0 || self.user_first() != 0 {
+            return id;
+        }
+        let Val::I32(g) = id else { unreachable!() };
+        use super::shader::USER_GROUP_BASE;
+        let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -4261,6 +4312,80 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    /// A program for dispatches by thread counts ([`with_thread_limits`]): the entry block
+    /// works out whether this thread was launched – its console thread's id in the dispatch
+    /// (its group's first, plus its index in the group) below the host's counts
+    /// ([`super::shader::USER_THREAD_LIMIT`]) along every dimension – and the others leave
+    /// there. The program goes on in `body`, and what is made "in the entry block" from here on
+    /// goes there too, so that what it asks of the wave (a ballot of EXEC on entry, a sum over
+    /// the lanes) counts the launched threads only, as the console's partial wave does.
+    /// Two host waves that exchange (a console wave64 program on a host of 32-lane waves) first
+    /// tell each other whether they have a launched thread: one with none leaves whole, and its
+    /// exchange dword keeps that 0, which is what a half without a lane in EXEC gives every
+    /// exchange but a reduction's join ([`Self::partner_live`]).
+    // shortcut: a thread that leaves is taken to stop holding up the group's barriers, as an
+    // exited thread does on NVIDIA's and AMD's GPUs (D3D12 leaves a barrier that some thread
+    // of the group does not reach undefined).
+    fn thread_limit_prologue(&mut self, body: usize) -> Result<(), Why> {
+        use super::shader::USER_THREAD_LIMIT;
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return Err("thread counts outside compute");
+        };
+        // (one host thread with two console lanes cannot leave for one of them)
+        if self.twin.is_some() {
+            return Err(LIMITS_INEXACT);
+        }
+        let e = self.s.entry;
+        let mut live: Option<V> = None;
+        // (a dimension whose groups are one thread wide is never cut short: its count is its
+        // groups' and no word is asked for it, which keeps the user data of the structure
+        // builder's programs, whose root signatures are close to the host's 64 dwords, one
+        // dword longer at most)
+        for d in (0..3u8).filter(|&d| cs.threads[usize::from(d)] > 1) {
+            let limit = self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, u32::from(d));
+            let Val::I32(group) = self.group_id(d) else {
+                return Err("a group id");
+            };
+            let Val::I32(thread) = self.thread_id(d) else {
+                return Err("a thread id");
+            };
+            let size = self.s.m.i32(cs.threads[usize::from(d)]);
+            let first = self.s.m.bin(e, Bin::Mul, group, size);
+            let id = self.s.m.bin(e, Bin::Add, first, thread);
+            let inside = self.s.m.cmp(e, pred::IULT, id, limit);
+            live = Some(match live {
+                Some(l) => self.s.m.bin(e, Bin::And, l, inside),
+                None => inside,
+            });
+        }
+        let Some(live) = live else {
+            // (groups of one thread: none is ever cut short)
+            self.s.m.terminate(e, Term::Br(body));
+            self.s.entry = body;
+            self.cur = body;
+            return Ok(());
+        };
+        if self.exchange.as_ref().is_some_and(|x| !x.1) && !self.local {
+            let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+            let some = self.s.op(e, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[live]);
+            self.s.flags |= flags::WAVE_OPS;
+            let some = self.s.m.cast(e, Cast::ZExt, some, i32t);
+            let (lo, hi) = self.exchange_halves(e, some);
+            let cl = self.console_lane();
+            let k32 = self.s.m.i32(32);
+            let upper = self.s.m.cmp(e, pred::IUGE, cl, k32);
+            let other = self.s.m.select(e, upper, lo, hi);
+            let z = self.s.m.i32(0);
+            self.partner_live = Some(self.s.m.cmp(e, pred::NE, other, z));
+        }
+        let gone = self.s.m.new_block();
+        self.s.m.terminate(e, Term::CondBr(live, body, gone));
+        self.s.m.terminate(gone, Term::Ret);
+        self.s.entry = body;
+        self.cur = body;
+        Ok(())
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -7609,7 +7734,12 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                    // (not where a dispatch by thread counts may have launched no lower lane:
+                    // `partner_live`)
+                    if guard.is_none()
+                        && super::shader_opt() & super::bitcode::opt::FIRST != 0
+                        && self.partner_live.is_none()
+                    {
                         // Every lane is in EXEC: the console's first lane is
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has

@@ -365,3 +365,221 @@ fn the_builders_wave64_programs_agree_with_their_paired_form() {
     eprintln!("{compared} runs compared");
     assert!(differ.is_empty(), "the forms differ: {differ:?}");
 }
+
+/// A compute program of `threads` threads a group (a power of two; `wave64`: in console waves
+/// of 64 lanes) that stores, at dword `group * threads + thread` of its root UAV (root
+/// parameter 0, user data 0 and 1, whose descriptor it builds as the builder's programs do),
+/// the thread's index in its group plus 1. The group id arrives in s2, after the address.
+fn numbering(wave64: bool, threads: u32) -> NativeProgram {
+    use crate::native::{ComputeIo, ResourceType, RootParam, UsedResource};
+    let words: Vec<u32> = vec![
+        0x8F0C_0002 | (0x80 + threads.trailing_zeros()) << 8, // s_lshl_b32 s12, s2, log2(threads)
+        0x8801_FF01,
+        0x0001_0000, // s_or_b32 s1, s1, 0x10000 (a stride of 1)
+        0xBE82_03C1, // s_mov_b32 s2, -1 (records)
+        0xBE83_03FF,
+        0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+        0x4A02_000C, // v_add_nc_u32 v1, s12, v0
+        0x3404_0282, // v_lshlrev_b32 v2, 2, v1
+        0x4A06_0081, // v_add_nc_u32 v3, 1, v0
+        0xE070_1000,
+        0x8000_0302, // buffer_store_dword v3, v2, s[0:3], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        // two user SGPRs (the address), then the group id x
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1 | 1 << 7,
+            threads: [threads, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// `native` lowered for a host of 32-lane waves; `limited`: for dispatches by thread counts
+/// ([`lower::with_thread_limits`]).
+fn lowered_for(native: &NativeProgram, limited: bool) -> Result<HostShader, crate::ShaderError> {
+    let p = crate::spill::build(native)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, native)?;
+    let parts = lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = if limited {
+        lower::with_thread_limits(|| lower::lower(&parts))
+    } else {
+        lower::lower(&parts)
+    };
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    })
+}
+
+/// The console's `DispatchX` with `USE_THREAD_DIMENSIONS` counts threads: the last group is
+/// cut short, and no thread past the count runs (the builder rebuilds the levels of its
+/// pre-built trees in place, one node per thread, and a thread past a level's nodes would
+/// write a node over the next level's input). The host runs whole groups of the program in
+/// its form for that, given the count: every thread inside it stores, none past it does. In
+/// the plain form the whole last group stores. Run on the host GPU (or on WARP with
+/// `VICTORY_WARP=1`: nothing here asks for a wave size).
+#[test]
+fn a_dispatch_by_thread_counts_runs_no_thread_past_them() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref()).ok();
+    let mut shaders = Vec::new();
+    for (wave64, group) in [(false, 32u32), (true, 64)] {
+        let native = numbering(wave64, group);
+        let limited = lowered_for(&native, true).expect("lowered for thread counts");
+        let plain = lowered_for(&native, false).expect("lowered");
+        assert!(
+            limited
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(super::USER_THREAD_LIMIT)),
+            "the counts are read"
+        );
+        if let Some(v) = validator.as_mut() {
+            for s in [&limited, &plain] {
+                let mut copy = s.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+        }
+        shaders.push((group, limited, plain));
+    }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; not run");
+        return;
+    };
+    for (group, limited, plain) in &shaders {
+        let group = *group;
+        for threads in [group / 4 + 1, group + group / 2 - 3, 2 * group] {
+            let groups = threads.div_ceil(group);
+            let run = |shader: &HostShader| -> Vec<u32> {
+                let (root, pso) = host
+                    .compute_pipeline_bounded(shader)
+                    .unwrap_or_else(|e| panic!("pipeline: {e}"));
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if u.root == RootType::Other(super::USER_THREAD_LIMIT) {
+                        ud[u.index as usize] = [threads, 1, 1][u.dword.min(2) as usize];
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud)), (1, Root::Uav(vec![0; 256]))],
+                            views: &[],
+                            samplers: &[],
+                            groups: [groups, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("dispatch: {e}"));
+                out.into_iter().last().unwrap_or_default()
+            };
+            let want: Vec<u32> = (0..256).map(|i| if i < threads { i % group + 1 } else { 0 }).collect();
+            let out = run(limited);
+            assert_eq!(out[..256], want[..], "{threads} threads in groups of {group}");
+            let whole = run(plain);
+            let n = threads as usize;
+            assert_eq!(whole[..n], want[..n], "the plain form, inside the count");
+            if threads % group != 0 {
+                assert_ne!(whole[n], 0, "the plain form runs the whole last group");
+            }
+        }
+    }
+    eprintln!("ran: no thread past the counts stored");
+}
+
+/// The builder's programs translated for dispatches by thread counts
+/// ([`super::translate_thread_limited`]; the title dispatches its box rehydration, header
+/// copies and triangle reloads so): each translates as it does for group counts, but in the
+/// paired and the approximate forms, which are refused (a thread holding two console lanes
+/// cannot leave for one of them), and validates. `VICTORY_TEST_BVH_SAVE=<dir>`: each
+/// translation's DXIL container there (`<n>.threads.dxil`, n the container's place in the
+/// file), for a look with a disassembler. Translates only; nothing runs.
+#[test]
+fn the_builders_programs_translate_for_dispatches_by_thread_counts() {
+    let Some(path) = std::env::var_os("VICTORY_TEST_BVH_DLL") else {
+        eprintln!("VICTORY_TEST_BVH_DLL not set; not run");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("the builder DLL");
+    let save = std::env::var_os("VICTORY_TEST_BVH_SAVE").map(std::path::PathBuf::from);
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref()).ok();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let (mut done, mut refused, mut wrong) = (0, 0, Vec::new());
+    for (k, container) in containers(&bytes).into_iter().enumerate() {
+        let plain = super::translate(container);
+        let limited = super::translate_thread_limited(container);
+        match (plain, limited) {
+            (Err(_), _) => {}
+            (Ok(_), Ok(shader)) => {
+                done += 1;
+                let mut dxil = shader.dxil.clone();
+                if let Some(v) = validator.as_mut()
+                    && let Err(e) = v.validate(&mut dxil)
+                {
+                    wrong.push((k, e));
+                }
+                if let Some(dir) = &save {
+                    let _ = std::fs::create_dir_all(dir);
+                    let _ = std::fs::write(dir.join(format!("{k}.threads.dxil")), &shader.dxil);
+                }
+            }
+            (Ok(_), Err(crate::ShaderError::Unsupported { what, .. })) if what == lower::LIMITS_INEXACT => {
+                refused += 1;
+            }
+            (Ok(_), Err(e)) => wrong.push((k, e.to_string())),
+        }
+    }
+    lower::TEST_HOST_WAVE.set(was);
+    eprintln!("{done} translate for thread counts, {refused} refused (paired or approximate forms)");
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
