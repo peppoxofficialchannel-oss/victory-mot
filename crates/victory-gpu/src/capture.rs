@@ -316,6 +316,102 @@ fn read_back_of(
     }
 }
 
+/// As [`read_back`], of depth slice `slice` of a 3D texture: the copy box's
+/// `front`/`back` pick the slice (a 3D texture's first subresource is its
+/// whole volume, its other subresources the later mips), into a readback
+/// buffer that holds that one slice's rows.
+fn read_back_slice(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    slice: u32,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    let mut whole = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    // SAFETY: a live texture; outputs for its first subresource.
+    let desc = unsafe { texture.GetDesc() };
+    unsafe {
+        device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut whole), None, None, None);
+    }
+    let f = whole.Footprint;
+    let depth = u32::from(desc.DepthOrArraySize);
+    if slice >= depth || f.Width == 0 || f.Height == 0 {
+        return None;
+    }
+    if f.Depth <= 1 {
+        // Numbered per slice after all (every slice its own subresource): the
+        // slice is the subresource, and a whole one is what comes back.
+        return read_back_of(device, list, texture, slice * u32::from(desc.MipLevels));
+    }
+    let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+        Offset: 0,
+        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: f.Format,
+            Width: f.Width,
+            Height: f.Height,
+            Depth: 1,
+            RowPitch: f.RowPitch,
+        },
+    };
+    let size = u64::from(f.RowPitch) * u64::from(f.Height);
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; an open list; locations naming live resources,
+    // the box one slice of the volume.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+        let buffer = buffer?;
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&buffer),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let one = D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: slice,
+            right: f.Width,
+            bottom: f.Height,
+            back: slice + 1,
+        };
+        list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&one));
+        Some((buffer, footprint))
+    }
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
@@ -350,6 +446,9 @@ pub(crate) fn save_read_back(
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
+/// A 3D texture (a colour LUT, a table) is saved as its middle slice, named
+/// `...-<w>x<h>-s<slice>d<depth>-f<format>.png`: a volume is not an image,
+/// one slice of it is.
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
@@ -382,13 +481,51 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        // A 3D texture (the colour LUTs, the ACES table) is dumped too: one
+        // slice of it, see [`dump_slice`].
+        if d.SampleDesc.Count > 1
+            || !matches!(
+                d.Dimension,
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            )
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
+}
+
+/// The slice a target is dumped as, and the part of its name that says so:
+/// `None` for a 2D texture, saved whole and with no suffix; for a 3D one the
+/// middle slice (`DepthSlice = depth/2`), `-s<slice>d<depth>` before
+/// `-f<format>`.
+fn dump_slice(dimension: D3D12_RESOURCE_DIMENSION, depth: u16) -> Option<(u32, String)> {
+    (dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D).then(|| {
+        let slice = u32::from(depth) / 2;
+        (slice, format!("-s{slice}d{depth}"))
+    })
+}
+
+/// The name a target's dump is saved under:
+/// `frame-<n>-<i>-<resource>-<w>x<h>`, then `-s<slice>d<depth>` for a 3D
+/// texture (one slice of a volume, see [`dump_slice`]), then
+/// `-f<format>`.
+fn dump_name(
+    frame: u64,
+    i: usize,
+    resource: &str,
+    d: &D3D12_RESOURCE_DESC,
+    slice: Option<&(u32, String)>,
+) -> String {
+    format!(
+        "frame-{frame}-{i:02}-{resource}-{}x{}{}-f{}",
+        d.Width,
+        d.Height,
+        slice.map(|(_, s)| s.as_str()).unwrap_or(""),
+        d.Format.0
+    )
 }
 
 fn dump_one(
@@ -401,6 +538,7 @@ fn dump_one(
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
+    let slice = dump_slice(d.Dimension, d.DepthOrArraySize);
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -409,12 +547,16 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = match &slice {
+            Some((slice, _)) => read_back_slice(&host.device, &list.list, texture, *slice),
+            None => read_back(&host.device, &list.list, texture),
+        };
         // The stencil plane of a depth-stencil target, which the title's
         // lighting reads (material class in the low bits; 0x08 "inside a
         // room", which the lamps of a room are multiplied by): the plane
         // after the depth plane of a one-level, one-slice texture.
         let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
+            && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
             && d.MipLevels == 1
             && d.DepthOrArraySize == 1)
             .then(|| read_back_of(&host.device, &list.list, texture, 1))
@@ -462,10 +604,7 @@ fn dump_one(
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
+            let name = dump_name(frame, i, &format!("{resource:?}"), d, slice.as_ref());
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -859,5 +998,43 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// A 3D target (a colour LUT, the ACES table) is dumped as its middle
+    /// slice, and its name says which slice and how deep, before the format;
+    /// a 2D one keeps the name it always had.
+    #[test]
+    fn a_3d_target_is_dumped_as_its_middle_slice_and_named_so() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let mut d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            Width: 33,
+            Height: 33,
+            DepthOrArraySize: 33,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(10),
+            ..Default::default()
+        };
+        let slice = super::dump_slice(d.Dimension, d.DepthOrArraySize);
+        assert_eq!(slice.as_ref().map(|(s, n)| (*s, n.as_str())), Some((16, "-s16d33")));
+        assert_eq!(
+            super::dump_name(7, 2, "0x1234", &d, slice.as_ref()),
+            "frame-7-02-0x1234-33x33-s16d33-f10"
+        );
+        // The middle slice of an even depth is the one past the middle.
+        assert_eq!(
+            super::dump_slice(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64).as_ref().map(|(s, n)| (*s, n.as_str())),
+            Some((32, "-s32d64"))
+        );
+        // A 2D target: no slice, no suffix.
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.DepthOrArraySize = 1;
+        let slice = super::dump_slice(d.Dimension, d.DepthOrArraySize);
+        assert_eq!(slice, None);
+        assert_eq!(
+            super::dump_name(7, 2, "0x1234", &d, slice.as_ref()),
+            "frame-7-02-0x1234-33x33-f10"
+        );
     }
 }
