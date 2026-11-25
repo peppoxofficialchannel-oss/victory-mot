@@ -214,6 +214,17 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether a helper lane of a pixel program is its own first lane in the
+/// title's first-lane reads (`lower::Lower::helper_own`; on by default).
+/// `VICTORY_HELPER_OWN=0` turns it off: helper lanes then read the host
+/// wave's first lane, as before 2026-11-25, for telling what the fix changes
+/// on screen. Part of the translation: the shader cache keys on it (it is
+/// one of the switches `translation_fingerprint` reads).
+pub fn helper_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HELPER_OWN").map_or(true, |v| v.trim() != "0"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

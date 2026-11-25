@@ -1364,7 +1364,8 @@ impl<'a> Lower<'a> {
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             notes: None,
-            helper_scalars: x.native.stage == HwStage::Ps
+            helper_scalars: super::helper_own()
+                && x.native.stage == HwStage::Ps
                 && p.blocks
                     .iter()
                     .any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
@@ -4339,7 +4340,7 @@ impl<'a> Lower<'a> {
     /// (the character skin and cloth program `94d281151ca58b4f` samples its layers in nine
     /// such nested loops).
     fn helper_own(&mut self, x: V, first: V) -> V {
-        if !self.s.pixel {
+        if !self.s.pixel || !super::helper_own() {
             return first;
         }
         let c = self.cur;
