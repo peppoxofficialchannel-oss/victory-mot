@@ -11,8 +11,9 @@
 //! - `W`: from the builder's first dispatch on, every range of title
 //!   memory a submission's shader writes were put back into, with its
 //!   first bytes;
-//! - `V`: what walking the structures the builder made found
-//!   (`VICTORY_BVH_CHECK`, [`header_stage`]).
+//! - `V`: what walking the structures the builder made on the card found,
+//!   `V rebuilt` for those it rebuilt in place from what was streamed
+//!   (`VICTORY_BVH_CHECK`, [`check_stages`]).
 //!
 //! The file is written unbuffered: a run that ends in the title's crash
 //! keeps every line written before it.
@@ -99,20 +100,51 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     text.trim_end().to_owned()
 }
 
-/// `VICTORY_BVH_CHECK=<hash>`: the builder stage that writes structure
-/// headers (InitHeaders: its first root view is an array of 40-byte
-/// records in list upload memory, each naming a header at +0, and the first
-/// dword of its root constants their count). Given at run time: the
-/// stage's hash is the title's. The structures its records name are walked
-/// a frame later ([`check_due`]) and a `V` line says what was found.
-pub(crate) fn header_stage() -> Option<&'static str> {
-    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| std::env::var("VICTORY_BVH_CHECK").ok().filter(|_| on()))
-        .as_deref()
+/// `VICTORY_BVH_CHECK=<hash>[,<hash>]`: the builder stages whose structures
+/// are walked a frame later ([`check_due`]), a `V` line saying what was
+/// found. The first writes structure headers (InitHeaders: its first root
+/// view is an array of 40-byte records in list upload memory, each naming a
+/// header at +0, and the first dword of its root constants their count):
+/// the structures built on the card. The second, if given, starts the
+/// rebuilding of a pre-built structure in place, its header at its root
+/// view 1 (DecompressHeader): the structures streamed from disk. Given at
+/// run time: the stages' hashes are the title's.
+fn check_stages() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_BVH_CHECK")
+            .ok()
+            .filter(|_| on())
+            .map(|v| v.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect())
+            .unwrap_or_default()
+    })
 }
 
-/// Headers named, by the frame they were named in.
-static NAMED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// The stage writing the headers of structures built on the card
+/// ([`check_stages`]).
+pub(crate) fn header_stage() -> Option<&'static str> {
+    check_stages().first().map(String::as_str)
+}
+
+/// The stage starting the rebuilding of a pre-built structure in place
+/// ([`check_stages`]).
+pub(crate) fn rebuild_stage() -> Option<&'static str> {
+    check_stages().get(1).map(String::as_str)
+}
+
+/// Headers named, by the frame they were named in, and whether the
+/// structure is rebuilt in place.
+static NAMED: Mutex<Vec<(u64, u64, bool)>> = Mutex::new(Vec::new());
+
+/// Notes the structure a rebuilding stage starts on, whose header is at
+/// `header` ([`rebuild_stage`]).
+pub(crate) fn rebuilt_named(header: u64) {
+    let frame = crate::frame::current();
+    let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    if header != 0 && named.len() < 1 << 16 {
+        named.push((frame, header, true));
+    }
+}
 /// The frame [`check_due`] last ran in.
 static CHECKED: AtomicU64 = AtomicU64::new(0);
 
@@ -129,7 +161,7 @@ pub(crate) fn headers_named(records: u64, count: u32) {
     for record in bytes.chunks_exact(40) {
         let header = u64::from_le_bytes(record[0..8].try_into().unwrap_or_default());
         if header != 0 && named.len() < 1 << 16 {
-            named.push((frame, header));
+            named.push((frame, header, false));
         }
     }
 }
@@ -266,34 +298,43 @@ fn walk(header: u64, w: &mut Walk) {
 }
 
 /// Walks the structures named a frame or more before this one, once a
-/// frame, and says what it found in a `V` line.
+/// frame, and says what it found in a `V` line for those built on the card
+/// and a `V rebuilt` line for those rebuilt in place.
 fn check_due() {
-    if header_stage().is_none() {
+    if check_stages().is_empty() {
         return;
     }
     let frame = crate::frame::current();
     if CHECKED.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
-    let due: Vec<u64> = {
+    let due: Vec<(u64, bool)> = {
         let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
-        let (due, later): (Vec<_>, Vec<_>) = named.drain(..).partition(|&(at, _)| at < frame);
+        let (due, later): (Vec<_>, Vec<_>) = named.drain(..).partition(|&(at, _, _)| at < frame);
         *named = later;
-        let mut due: Vec<u64> = due.into_iter().map(|(_, h)| h).collect();
+        let mut due: Vec<(u64, bool)> = due.into_iter().map(|(_, h, rebuilt)| (h, rebuilt)).collect();
         due.sort_unstable();
         due.dedup();
         due
     };
-    if due.is_empty() {
-        return;
+    for rebuilt in [false, true] {
+        let headers: Vec<u64> = due.iter().filter(|d| d.1 == rebuilt).map(|d| d.0).collect();
+        if !headers.is_empty() {
+            walk_line(&headers, if rebuilt { "V rebuilt" } else { "V" });
+        }
     }
+}
+
+/// Walks the structures at `headers` and says what it found in a line led
+/// by `kind`.
+fn walk_line(headers: &[u64], kind: &str) {
     let mut w = Walk::default();
-    for header in due {
+    for &header in headers {
         walk(header, &mut w);
     }
     line(|| {
         format!(
-            "V structures {} empty {} unreadable {} box nodes {} triangles {} instances {} bad {}{}",
+            "{kind} structures {} empty {} unreadable {} box nodes {} triangles {} instances {} bad {}{}",
             w.structures,
             w.empty,
             w.unreadable,

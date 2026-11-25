@@ -2200,6 +2200,13 @@ impl State {
                     });
                 }
             }
+            // A pre-built structure rebuilt in place from its header, at the
+            // stage's root view 1 (`crate::bvhtrace::rebuild_stage`).
+            if crate::bvhtrace::rebuild_stage() == Some(hash.as_str())
+                && let Some(&Root::View(header)) = self.compute.get(1)
+            {
+                crate::bvhtrace::rebuilt_named(header);
+            }
         }
         crate::bvhtrace::line(|| {
             let hash = p.stages.first().map_or("?", |s| s.shader.hash.as_str());
