@@ -3186,6 +3186,10 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            wide_dispatch(p, arguments, stride, max);
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -3213,6 +3217,40 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// Diagnostics, for an indirect dispatch of pipeline `p`: which program
+/// asks for more groups in x than one host dispatch runs (65,535: the clamp
+/// cuts the rest, `crate::indirect`). The clamp counts such records per
+/// list, without saying whose they are. The arguments are read where the
+/// title's memory has them: the card writes them, so this is what an
+/// earlier frame's copy-back left there (one to four records). Logged once
+/// per program, with the largest count seen then.
+#[cfg(feature = "diagnostics")]
+fn wide_dispatch(p: &HostPipeline, arguments: u64, stride: u32, max: u32) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    for i in 0..u64::from(max.clamp(1, 4)) {
+        let at = arguments + i * u64::from(stride);
+        if !crate::texture::committed(at as *const u8, 12) {
+            return;
+        }
+        // SAFETY: 12 committed bytes of title memory.
+        let g = unsafe { (at as *const [u32; 3]).read_unaligned() };
+        // Not the garbage of a slot nothing wrote (the clamp's own test).
+        if g[0] <= 65535 || g[0] > 1 << 24 || g[1] > 64 || g[2] > 64 {
+            continue;
+        }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 64 && !seen.contains(&p.name) {
+            seen.push(p.name.clone());
+            tracing::warn!(
+                pipeline = %p.name,
+                groups = ?g,
+                "an indirect dispatch asks for more groups in x than one dispatch runs: the clamp cuts it to 65,535 and the rest do not run"
+            );
+        }
+        return;
     }
 }
 
