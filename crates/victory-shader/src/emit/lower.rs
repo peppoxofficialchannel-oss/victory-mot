@@ -48,6 +48,11 @@ use regions::{all_lane_blocks, lane_regions};
 #[path = "float64.rs"]
 mod float64;
 
+/// The paired form's guarded writes read without their guard where only lanes inside it read
+/// them, a child module so it shares the emitter's state.
+#[path = "guarded.rs"]
+mod guarded;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -355,6 +360,12 @@ struct Lower<'a> {
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
+    /// The paired form: what guarded writes computed before their guard, for readers under a
+    /// guard that implies it ([`guarded`]); the guard of the instruction being lowered when
+    /// its sources may be read so; the searches of those implications.
+    raw: guarded::Raws,
+    raw_use: Option<(Bool, V)>,
+    raw_meets: crate::structure::Meets,
     /// Linked for one pipeline ([`super::link`]): per input and output element, whether it
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
@@ -379,6 +390,7 @@ struct LaneState {
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     strides: HashMap<(usize, Site, u8), V>,
     clane: Option<V>,
+    raw: guarded::Raws,
 }
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
@@ -1378,6 +1390,9 @@ impl<'a> Lower<'a> {
             upper: false,
             lds_last: None,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
+            raw: HashMap::new(),
+            raw_use: None,
+            raw_meets: Default::default(),
             drop_in,
             drop_out,
         }
@@ -1406,6 +1421,7 @@ impl<'a> Lower<'a> {
         std::mem::swap(&mut self.handles, &mut t.handles);
         std::mem::swap(&mut self.strides, &mut t.strides);
         std::mem::swap(&mut self.clane, &mut t.clane);
+        std::mem::swap(&mut self.raw, &mut t.raw);
         self.upper = !self.upper;
     }
 
@@ -2879,7 +2895,7 @@ impl<'a> Lower<'a> {
         };
         let word = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
@@ -3185,7 +3201,7 @@ impl<'a> Lower<'a> {
             }
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.source(v)
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -3270,10 +3286,13 @@ impl<'a> Lower<'a> {
                 let val = inst.read(r).ok_or("an unread operand")?;
                 match self.floats.get(&val) {
                     Some(&f) => f,
-                    None => {
-                        let x = self.i32_of(val)?;
-                        self.as_float(x)
-                    }
+                    None => match self.raw_float(val) {
+                        Some(f) => f,
+                        None => {
+                            let x = self.i32_of(val)?;
+                            self.as_float(x)
+                        }
+                    },
                 }
             }
             _ => {
@@ -3999,6 +4018,7 @@ impl<'a> Lower<'a> {
                 };
                 let v = self.s.m.select(self.cur, g, x, old);
                 self.s.m.tag(v, Tag::Guard);
+                self.note_raw(new, x, g);
                 v
             }
             _ => x,
@@ -4065,11 +4085,14 @@ impl<'a> Lower<'a> {
         };
         let x = self.as_int(f);
         self.write(inst, Reg::V(reg), x, guard);
-        if guard.is_none()
-            && Self::sdwa_dst(inst).is_none()
+        if Self::sdwa_dst(inst).is_none()
             && let Some(new) = inst.write(Reg::V(reg))
         {
-            self.floats.insert(new, f);
+            if guard.is_none() {
+                self.floats.insert(new, f);
+            } else {
+                self.note_raw_float(new, f);
+            }
         }
         Ok(())
     }
@@ -4434,7 +4457,7 @@ impl<'a> Lower<'a> {
         (0..n)
             .map(|k| {
                 let v = inst.read(Reg::V(reg + k)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.source(v)
             })
             .collect()
     }
@@ -4897,6 +4920,8 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        // (a guard with no host value: the instruction's own lowering says so where it needs it)
+        self.raw_use = self.raw_use_for(b, i, inst).unwrap_or(None);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4942,12 +4967,14 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        self.raw_use = None;
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
+                    self.raw.remove(&v);
                 }
                 Ok(())
             }
@@ -7064,12 +7091,15 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
-                    Some(&x) => x,
-                    None => {
-                        let x = self.i32_of(acc)?;
-                        self.as_float(x)
-                    }
+                let acc = match self.floats.get(&acc).copied() {
+                    Some(x) => x,
+                    None => match self.raw_float(acc) {
+                        Some(x) => x,
+                        None => {
+                            let x = self.i32_of(acc)?;
+                            self.as_float(x)
+                        }
+                    },
                 };
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
@@ -9125,7 +9155,7 @@ impl<'a> Lower<'a> {
         let addr_u32 = |l: &mut Self, reg_idx: usize| -> Result<V, Why> {
             let r = *regs.get(reg_idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
         let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
@@ -9944,7 +9974,7 @@ impl<'a> Lower<'a> {
         };
         let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
