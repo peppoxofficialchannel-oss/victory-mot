@@ -649,13 +649,27 @@ fn the_builders_programs_translate_for_dispatches_by_thread_counts() {
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref()).ok();
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let (mut done, mut refused, mut wrong) = (0, 0, Vec::new());
+    // the dwords of the root signature the layer makes (`pipeline/host.rs`): the user data as
+    // root constants, root CBVs as root descriptors, the title's root SRVs and UAVs as
+    // one-view tables, ours as root descriptors; D3D12 allows 64
+    let ours = |s: u8| s >= super::SLOT_LOOPS;
+    let cost = |h: &HostShader| {
+        h.user_data_dwords()
+            + 2 * h.root_cbvs.len() as u32
+            + h.root_srvs.iter().chain(&h.root_uavs).map(|&s| if ours(s) { 2 } else { 1 }).sum::<u32>()
+    };
+    let mut most = (0, 0);
     for (k, container) in containers(&bytes).into_iter().enumerate() {
         let plain = super::translate(container);
         let limited = super::translate_thread_limited(container);
         match (plain, limited) {
             (Err(_), _) => {}
-            (Ok(_), Ok(shader)) => {
+            (Ok(plain), Ok(shader)) => {
                 done += 1;
+                most = (most.0.max(cost(&plain)), most.1.max(cost(&shader)));
+                if cost(&shader) > 64 {
+                    wrong.push((k, format!("a root signature of {} dwords", cost(&shader))));
+                }
                 let mut dxil = shader.dxil.clone();
                 if let Some(v) = validator.as_mut()
                     && let Err(e) = v.validate(&mut dxil)
@@ -674,6 +688,9 @@ fn the_builders_programs_translate_for_dispatches_by_thread_counts() {
         }
     }
     lower::TEST_HOST_WAVE.set(was);
-    eprintln!("{done} translate for thread counts, {refused} refused (paired or approximate forms)");
+    eprintln!(
+        "{done} translate for thread counts, {refused} refused (paired or approximate forms); root signatures of {} dwords at most ({} for group counts)",
+        most.1, most.0
+    );
     assert!(wrong.is_empty(), "{wrong:?}");
 }
