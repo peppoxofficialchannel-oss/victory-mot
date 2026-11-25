@@ -643,6 +643,12 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(chosen) = victory_shader::host_gpu::choose() {
+            // The hardware adapter with the most dedicated memory: on a hybrid
+            // laptop the discrete card, where DXGI's default is the
+            // integrated one (and pipelines made for the discrete card fail
+            // there). The pick is logged once per run (`host GPU adapter:`).
+            D3D12CreateDevice(&chosen.adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }

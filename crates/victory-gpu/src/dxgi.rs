@@ -85,6 +85,12 @@ pub(crate) fn device() -> This {
     &DEVICE
 }
 
+/// The one adapter the console reports, as a title that enumerated it holds
+/// it (what `D3D12XboxCreateDevice` may name).
+pub(crate) fn adapter() -> This {
+    &raw const ADAPTER_OBJECT
+}
+
 /// `found` if `iid` is one of `known`.
 fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut This) -> HRESULT {
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)

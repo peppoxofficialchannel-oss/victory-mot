@@ -12,6 +12,9 @@ pub mod dxil;
 pub mod emit;
 pub mod geometry;
 pub mod gfx10;
+// Which host GPU the D3D12 device runs on (the layer's and the tests').
+#[cfg(all(windows, any(test, feature = "host")))]
+pub mod host_gpu;
 pub mod io;
 pub mod ir;
 pub mod native;

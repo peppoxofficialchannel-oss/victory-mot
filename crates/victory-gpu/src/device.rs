@@ -126,7 +126,7 @@ pub(crate) fn device() -> This {
 /// with the interface version; the rest (ring and scratch sizes, features
 /// to leave out) does not matter to us yet.
 pub extern "system" fn create(
-    _adapter: *const c_void,
+    adapter: *const c_void,
     parameters: *const u32,
     iid: *const Iid,
     out: *mut This,
@@ -146,6 +146,22 @@ pub extern "system" fn create(
     if !is_device(iid) {
         tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
         return E_NOINTERFACE;
+    }
+    // The adapter the title names is the one it enumerated from us: the
+    // console's single GPU (DXGI reports one adapter here, described as the
+    // console's). It has no host identity of its own — which host card plays
+    // it is the layer's choice, logged once as `host GPU adapter: ...` by
+    // `host` — so there is nothing to map it to; say the title asked for it
+    // rather than ignore the pointer. A pointer the layer did not make is
+    // never dereferenced.
+    if !adapter.is_null() {
+        if adapter == crate::dxgi::adapter().cast::<c_void>() {
+            tracing::info!(
+                "the title created its device on the adapter it enumerated (the console GPU); the host card is the layer's pick"
+            );
+        } else {
+            tracing::warn!(adapter = ?adapter, "device created on an adapter the layer did not make");
+        }
     }
     if out.is_null() {
         return S_FALSE;

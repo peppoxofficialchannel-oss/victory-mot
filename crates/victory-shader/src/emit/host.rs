@@ -113,7 +113,21 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // The hardware adapter with the most dedicated memory (the
+                // discrete card on a hybrid laptop), not whichever adapter
+                // DXGI lists first: a pipeline made for the discrete card is
+                // refused on the integrated one. The pick is logged once per
+                // process (`host GPU adapter: ...`). Without one, the default
+                // device, as before.
+                match crate::host_gpu::choose() {
+                    Some(chosen) => {
+                        D3D12CreateDevice(&chosen.adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                            .map_err(err)?;
+                    }
+                    None => {
+                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                    }
+                }
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
