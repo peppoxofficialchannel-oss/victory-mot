@@ -977,6 +977,12 @@ fn read_stream(
         };
         at += size;
     }
+    // From #501: the title's stream enables blending on a target whose host format is an integer
+    // one, which D3D12 refuses outright (`E_INVALIDARG`, debug layer 676: `R8_UINT` at slot 2), so
+    // the whole pipeline is refused and its draw dropped every frame — `[mesh f5e50eb2108c425b,
+    // pixel ce3f0432a08f1d35]` on this machine. The console leaves such a target unblended.
+    #[cfg(windows)]
+    graphics.integer_targets_unblended();
     (shaders, graphics)
 }
 
