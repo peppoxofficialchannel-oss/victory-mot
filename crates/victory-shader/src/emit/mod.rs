@@ -93,6 +93,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(test, windows))]
 mod loop_tests;
+pub mod forms;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
@@ -437,6 +438,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    forms::clear();
     let r = emit_any(c, native, p, st, io, res);
     if r.is_ok() && !permutes_outside_sections(p) {
         return r;
@@ -1056,6 +1058,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
     };
+    forms::note(&shader.dxil, l.form);
     Ok((shader, wave_size))
 }
 

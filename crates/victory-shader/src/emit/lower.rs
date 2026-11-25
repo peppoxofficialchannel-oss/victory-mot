@@ -73,6 +73,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// Bit n: immediate sampler n is used for comparisons.
+    pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -83,6 +85,9 @@ pub(crate) struct Lowered {
     pub samplers: Vec<([u32; 4], bool)>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// How a console wave64 compute program was run on a host of 32-lane waves
+    /// ([`super::forms`]), empty otherwise.
+    pub form: &'static str,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -2222,9 +2227,21 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let form = match () {
+            _ if self.twin.is_some() => super::forms::PAIRED,
+            _ if self.local && self.local_any => super::forms::LOCAL_ANY,
+            _ if self.local => super::forms::LOCAL,
+            _ if self.exchange.is_some() => super::forms::EXCHANGE,
+            _ if self.halves.is_some() => super::forms::HALVES,
+            _ if self.x.native.wave64 && wave_size == Some(64) => super::forms::WAVE64,
+            _ => "",
+        };
         Ok(Lowered {
             wave_size,
+            form,
+            cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,

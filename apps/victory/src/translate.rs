@@ -779,7 +779,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
 }
 
 /// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
-/// its label, the console program's instructions by encoding class (a
+/// its label, the form a console wave64 compute program took on the host
+/// (`emit::forms`), the console program's instructions by encoding class (a
 /// static count of the whole program, not of one thread's path), and the
 /// host module's instructions by kind (`emit::census::KINDS`).
 fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
@@ -812,7 +813,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         };
         console[k] += 1;
     }
-    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    let mut line = format!("{label}\twave64={}\tform={}", u8::from(native.wave64), emit::forms::form_of(&shader.dxil));
     for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
         line.push_str(&format!("\t{name}={n}"));
     }
