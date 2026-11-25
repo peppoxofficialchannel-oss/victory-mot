@@ -313,10 +313,10 @@ fn translate(container: &[u8], thread_limited: bool) -> Result<Translated, Strin
 /// made" would be a dropped stage). One that cannot be made turns the
 /// builder off for the rest of the run.
 ///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
+/// shortcut: and only with `VICTORY_BVH_BUILDER=1`. Runs on a card have
+/// shown the whole builder and the host side of title memory by address
+/// (`memory.rs`) working (420 s of gameplay, no fault), at a cost that
+/// keeps it off by default ([`builder_runs`]).
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
@@ -341,7 +341,7 @@ static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 
 /// Whether the programs that walk the title's ray-tracing structures may
 /// read their nodes: the structure builder runs ([`Builder`]). While it
-/// does not (before its first dispatch, with `VICTORY_BVH_BUILDER=0`, or
+/// does not (before its first dispatch, without `VICTORY_BVH_BUILDER=1`, or
 /// once turned off), every node test of theirs answers no hit without
 /// reading memory (`victory_shader::emit::USER_STRUCTURES`): no box is
 /// entered and no triangle hit, so their rays see an empty scene instead
@@ -486,7 +486,10 @@ pub(crate) fn builder_off(why: &'static str) {
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
+/// [`Builder`]; off unless `VICTORY_BVH_BUILDER=1`). Off by default: with it
+/// on, the opening cutscene's frame went from 385 to 752 ms (median, two
+/// successive builds of our tree) and the card took some 88 ms more a frame
+/// in gameplay; node tests answer "no hit" while it does not run.
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
