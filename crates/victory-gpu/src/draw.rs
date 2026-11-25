@@ -3362,8 +3362,9 @@ fn wide_dispatch(p: &HostPipeline, arguments: u64, stride: u32, max: u32) {
         }
         // SAFETY: 12 committed bytes of title memory.
         let g = unsafe { (at as *const [u32; 3]).read_unaligned() };
-        // Not the garbage of a slot nothing wrote (the clamp's own test).
-        if g[0] <= MOST_GROUPS || g[0] > 1 << 24 || g[1] > 64 || g[2] > 64 {
+        // Not the garbage of a slot nothing wrote (the clamp's own test),
+        // nor a record that runs nothing (no group in y or z).
+        if g[0] <= MOST_GROUPS || g[0] > 1 << 24 || !(1..=64).contains(&g[1]) || !(1..=64).contains(&g[2]) {
             continue;
         }
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
