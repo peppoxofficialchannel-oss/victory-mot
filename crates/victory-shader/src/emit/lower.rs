@@ -82,8 +82,6 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -2302,7 +2300,6 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         let form = match () {
             _ if self.twin.is_some() => super::forms::PAIRED,
@@ -2316,7 +2313,6 @@ impl<'a> Lower<'a> {
         Ok(Lowered {
             wave_size,
             form,
-            cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
