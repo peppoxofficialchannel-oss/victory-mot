@@ -2267,6 +2267,12 @@ impl Shadow {
         self.id
     }
 
+    /// Whether the copy is of a window of memory outside buffers.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
