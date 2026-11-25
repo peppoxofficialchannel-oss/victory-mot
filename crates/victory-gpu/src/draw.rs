@@ -119,6 +119,49 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_DRAW_CLAMP=<n>`: at most `n` indirect records are executed in a
+/// frame, the rest are dropped; `0` executes none.
+///
+/// A measurement switch, not a fix: it exists to measure what a frame costs
+/// with nothing drawn (`0`), with a few records (`64`) and with all of them,
+/// on the same scene and camera, so that the frame's fixed cost and its cost
+/// per draw can be told apart. It clamps the record count handed to
+/// `ExecuteIndirect`, so it holds whether the count comes from the title's
+/// buffer or from a count the shaders wrote on the card, and it charges the
+/// whole allowance per call (the title's single records are one each).
+/// Off unless the variable is set; `VICTORY_DRAW_CLAMP=12000` must reproduce
+/// a run without it, which is the check that it perturbs nothing.
+fn draw_clamp() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_DRAW_CLAMP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// The records of this call that [`draw_clamp`] still allows, or none.
+/// The allowance is per presented frame: the counter starts again when the
+/// frame number changes.
+fn clamped_records(max: u32) -> Option<u32> {
+    let Some(budget) = draw_clamp() else {
+        return Some(max);
+    };
+    static STATE: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((u64::MAX, 0));
+    let frame = crate::queue::presented();
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.0 != frame {
+        *state = (frame, 0);
+    }
+    let left = budget.saturating_sub(state.1);
+    if left == 0 {
+        return None;
+    }
+    let take = u64::from(max).min(left);
+    state.1 += take;
+    Some(take as u32)
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -2885,6 +2928,14 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // `VICTORY_DRAW_CLAMP=<n>`: this frame's allowance of indirect
+        // records, dropped before the argument clamp (a measurement switch,
+        // see [`clamped_records`]).
+        let Some(max) = clamped_records(max) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("past VICTORY_DRAW_CLAMP for this frame".to_owned());
+            return false;
+        };
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
