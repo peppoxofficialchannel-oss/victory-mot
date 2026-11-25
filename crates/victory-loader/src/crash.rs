@@ -509,6 +509,66 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    // `VICTORY_CRASH_MEMORY=1` (diagnostics): the bytes around each register
+    // that holds an address of the title's memory (below 1 TiB) that can be
+    // read, to see what overwrote the data a pointer was loaded from.
+    #[cfg(feature = "diagnostics")]
+    if std::env::var_os("VICTORY_CRASH_MEMORY").is_some_and(|v| v == "1") {
+        let regs = [
+            ("rax", context.Rax),
+            ("rbx", context.Rbx),
+            ("rcx", context.Rcx),
+            ("rdx", context.Rdx),
+            ("rsi", context.Rsi),
+            ("rdi", context.Rdi),
+            ("rbp", context.Rbp),
+            ("r8", context.R8),
+            ("r9", context.R9),
+            ("r10", context.R10),
+            ("r11", context.R11),
+            ("r12", context.R12),
+            ("r13", context.R13),
+            ("r14", context.R14),
+            ("r15", context.R15),
+        ];
+        // One block per exception, printed at once: the title's threads
+        // fault together and their lines interleave.
+        use std::fmt::Write as _;
+        let title = |v: u64| (0x1_0000_0000..0x100_0000_0000).contains(&v);
+        // SAFETY: a plain query.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let mut dump = format!("  memory around the registers of thread {thread} (fault at {}):", locate(at));
+        let show = |dump: &mut String, name: &str, value: u64, len: usize| -> Vec<u64> {
+            let at = (value & !0xF) as usize;
+            let mut bytes = vec![0u8; len];
+            if !read_quietly(at, &mut bytes) {
+                return Vec::new();
+            }
+            let _ = write!(dump, "\n  [{name} {value:#x}] {}", region_of(at));
+            let qwords: Vec<u64> = bytes.chunks(8).map(|q| u64::from_le_bytes(q.try_into().unwrap_or_default())).collect();
+            for (k, row) in qwords.chunks(4).enumerate() {
+                let words: Vec<String> = row.iter().map(|q| format!("{q:016x}")).collect();
+                let _ = write!(dump, "\n    +{:#05x} {}", k * 32, words.join(" "));
+            }
+            qwords
+        };
+        for (name, value) in regs {
+            if !title(value) {
+                continue;
+            }
+            let qwords = show(&mut dump, name, value, 0x100);
+            // One level further: what the first fields point at (where a
+            // pointer the code loads from them was overwritten).
+            let mut followed = 0;
+            for (k, &q) in qwords.iter().take(0x20).enumerate() {
+                if followed < 6 && title(q) && (q ^ value) >> 16 != 0 {
+                    show(&mut dump, &format!("{name}+{:#x}->", k * 8), q, 0x80);
+                    followed += 1;
+                }
+            }
+        }
+        line(dump);
+    }
     if to_file {
         let said = title_output();
         eprint!("{said}");
@@ -614,6 +674,40 @@ fn module_of(address: usize) -> Option<String> {
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
     Some(format!("{name}+{:#x}", address - module as usize))
+}
+
+/// What kind of memory `at` lies in: its region's allocation base, size
+/// and type (private, a view of a section, an image).
+#[cfg(feature = "diagnostics")]
+fn region_of(at: usize) -> String {
+    use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `at` itself.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return "unknown".into();
+    }
+    let kind = match info.Type {
+        MEM_PRIVATE => "private",
+        MEM_MAPPED => "mapped view",
+        MEM_IMAGE => "image",
+        _ => "?",
+    };
+    format!(
+        "{kind}, region {:#x}+{:#x}, allocation {:#x}",
+        info.BaseAddress as usize, info.RegionSize, info.AllocationBase as usize
+    )
+}
+
+/// Reads `out.len()` bytes at `at` without faulting; false if a page of the
+/// range cannot be read.
+#[cfg(feature = "diagnostics")]
+fn read_quietly(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: the kernel checks the source; the destination is ours.
+    unsafe { ReadProcessMemory(GetCurrentProcess(), at as _, out.as_mut_ptr().cast(), out.len(), &mut done) != 0 }
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
