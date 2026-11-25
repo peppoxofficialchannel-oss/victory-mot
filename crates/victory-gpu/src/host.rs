@@ -375,6 +375,68 @@ fn copy_back(i: usize, n: u64) {
     crate::framelog::add([crate::framelog::T::CopyBackUs, crate::framelog::T::CopyBackBytes][i], n);
 }
 
+/// Whether `VICTORY_IO_TIMING` asks for the copy back's own split, once
+/// every 60 frames.
+fn io_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IO_TIMING").is_some_and(|v| v != "0"))
+}
+
+/// Whether `VICTORY_COPYBACK_OFF` asks for the copy back to be skipped
+/// (diagnostics): the title is handed neither what shaders wrote nor what its
+/// read-backs carried. The bottom-of-pipe values it waits on are still
+/// written, or it would stand for ever.
+fn copy_back_off() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COPYBACK_OFF").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!(
+                "the copy back is skipped (VICTORY_COPYBACK_OFF): the title is handed nothing back"
+            );
+        }
+        on
+    })
+}
+
+/// The copy back of one submission, in microseconds: `total` (the same span
+/// the frame line adds as "copying back"), and of it `issue` — the card
+/// fetch's commands recorded before the wait — and `wait`, the wait for the
+/// card. Added to the frame's sums, and printed once every 60 frames.
+///
+/// `map` is not measured and the line says so: the copy back of a frame maps
+/// no read-back buffer. The cards' fetch memory is mapped once, when it is
+/// made; the read-backs' own maps (`read_backs`) are the bottom-of-pipe
+/// copies that run after this span and the frame line does not count them.
+/// The rest of `total` is the compare and the merge.
+fn io_back(total: u64, issue: u64, wait: u64) {
+    if !io_timing() {
+        return;
+    }
+    IO_US[0].fetch_add(issue, Ordering::Relaxed);
+    IO_US[1].fetch_add(wait, Ordering::Relaxed);
+    IO_US[2].fetch_add(total, Ordering::Relaxed);
+    let frame = crate::frame::current();
+    if frame == 0
+        || !frame.is_multiple_of(60)
+        || IO_LOGGED.swap(frame, Ordering::Relaxed) == frame
+    {
+        return;
+    }
+    let ms = |us: u64| us as f64 / 1e3;
+    tracing::info!(
+        frame,
+        "io timings (VICTORY_IO_TIMING): frame={frame} issue={:.1} fence-wait={:.1} map=n/a total={:.1} ms",
+        ms(IO_US[0].swap(0, Ordering::Relaxed)),
+        ms(IO_US[1].swap(0, Ordering::Relaxed)),
+        ms(IO_US[2].swap(0, Ordering::Relaxed)),
+    );
+}
+
+/// `VICTORY_IO_TIMING`'s sums since the last line: issue, wait, total (µs).
+static IO_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static IO_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Adds to [`CARD_CLOCK_US`] and, for the card's idle times, to the frame
 /// log's totals.
 fn card_clock_us(i: usize, us: u64) {
@@ -4992,7 +5054,9 @@ impl Host {
                         }
                     }
                 }
-                relay_hand_back(&back);
+                if !copy_back_off() {
+                    relay_hand_back(&back);
+                }
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -5000,7 +5064,10 @@ impl Host {
                         shadow.copy_back_done(ranges);
                     }
                 }
-                copy_back(0, landing.elapsed().as_micros() as u64);
+                let back_us = landing.elapsed().as_micros() as u64;
+                copy_back(0, back_us);
+                // The relay's own fetch waits elsewhere: only the span.
+                io_back(back_us, 0, 0);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
@@ -5012,8 +5079,10 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                    if !copy_back_off() {
+                        for &i in &flight.order {
+                            read_backs(flight.lists[i].host());
+                        }
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5077,6 +5146,7 @@ impl Host {
         plan: &CardPlan,
         submitted: &mut u64,
         seen: &mut std::collections::HashSet<(usize, usize, usize)>,
+        io: &mut (u64, u64),
     ) {
         if plan.ranges.is_empty() {
             return;
@@ -5136,7 +5206,12 @@ impl Host {
                         }
                         let job = second.down.send(copy, &[(&self.fence, *submitted)], total)?;
                         let was_working = working(false);
+                        let waited = io_timing().then(std::time::Instant::now);
                         second.down.wait(job, self.event)?;
+                        if let Some(waited) = waited {
+                            io.1 += waited.elapsed().as_micros() as u64;
+                            io.0 += waited.duration_since(waiting).as_micros() as u64;
+                        }
                         stood(waiting);
                         working(was_working);
                         second.down.stats.waited_us.fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5154,7 +5229,12 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
+                    let waited = io_timing().then(std::time::Instant::now);
                     WaitForSingleObject(self.event, INFINITE);
+                    if let Some(waited) = waited {
+                        io.1 += waited.elapsed().as_micros() as u64;
+                        io.0 += waited.duration_since(waiting).as_micros() as u64;
+                    }
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5415,14 +5495,17 @@ impl Host {
                 }
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
+                let mut io = (0u64, 0u64);
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
                     };
-                    if let Some(card) = &flight.card {
-                        self.card_back(card, submitted, &mut seen);
+                    if let Some(card) = &flight.card
+                        && !copy_back_off()
+                    {
+                        self.card_back(card, submitted, &mut seen, &mut io);
                     }
                     for (shadow, ranges) in &flight.back {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
@@ -5437,8 +5520,18 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
-                copy_back(0, copying.elapsed().as_micros() as u64);
+                if copy_back_off() {
+                    // Skipped, but the ranges are still done with: another
+                    // flight's declares must not find them held.
+                    for (shadow, declared) in &back {
+                        shadow.copy_back_done(declared);
+                    }
+                } else {
+                    hand_back(&back);
+                }
+                let back_us = copying.elapsed().as_micros() as u64;
+                copy_back(0, back_us);
+                io_back(back_us, io.0, io.1);
             }
             // In the order given: what tells the title the card is done.
             let mut last = 0;
@@ -5447,8 +5540,10 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
-                        for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                        if !copy_back_off() {
+                            for &i in &flight.order {
+                                read_backs(flight.lists[i].host());
+                            }
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -5739,13 +5834,29 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let mut io = (0u64, 0u64);
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
-        if let Some(card) = &card {
-            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+        if let Some(card) = &card
+            && !copy_back_off()
+        {
+            self.card_back(
+                card,
+                &mut submitted,
+                &mut std::collections::HashSet::new(),
+                &mut io,
+            );
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        if copy_back_off() {
+            // Skipped, but the ranges are still done with: the next
+            // submission's declares must not find them held.
+            for (shadow, declared) in &back {
+                shadow.copy_back_done(declared);
+            }
+        } else {
+            hand_back(&back);
+        }
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5762,11 +5873,15 @@ impl Host {
             add(C::NothingBack, 1);
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
-        copy_back(0, copying.elapsed().as_micros() as u64);
+        let back_us = copying.elapsed().as_micros() as u64;
+        copy_back(0, back_us);
+        io_back(back_us, io.0, io.1);
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            if !copy_back_off() {
+                read_backs(list);
+            }
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
