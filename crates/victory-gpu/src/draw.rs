@@ -3292,14 +3292,18 @@ fn group_base(p: &HostPipeline) -> Option<(u32, u32)> {
 /// The host command signature for a split dispatch's records
 /// (`crate::indirect::SPLIT_DISPATCH`): one dword of root constants, the
 /// group base at dword `offset` of root parameter `param` of `root`, then
-/// the dispatch. Made once per root signature and place.
+/// the dispatch. Made once per root signature and place. The root signature
+/// is kept with it: a signature is found by the root signature's address,
+/// and D3D12 does not say that a command signature holds its root
+/// signature, so a root signature released and another made at its address
+/// would otherwise find one made for the first.
 fn split_signature(root: &ID3D12RootSignature, param: u32, offset: u32) -> Option<ID3D12CommandSignature> {
     use windows::core::Interface;
-    type Made = Vec<((usize, u32, u32), ID3D12CommandSignature)>;
+    type Made = Vec<((usize, u32, u32), ID3D12RootSignature, ID3D12CommandSignature)>;
     static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
     let key = (root.as_raw() as usize, param, offset);
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+    if let Some((_, _, s)) = made.iter().find(|(k, _, _)| *k == key) {
         return Some(s.clone());
     }
     let arguments = [
@@ -3333,8 +3337,7 @@ fn split_signature(root: &ID3D12RootSignature, param: u32, offset: u32) -> Optio
         return None;
     }
     let signature = signature?;
-    // The signature names the root signature: kept as long as it is.
-    made.push((key, signature.clone()));
+    made.push((key, root.clone(), signature.clone()));
     Some(signature)
 }
 
