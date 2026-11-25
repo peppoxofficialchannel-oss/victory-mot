@@ -1001,10 +1001,9 @@ fn system_timestamp() -> u64 {
     0
 }
 
-/// Frames presented so far.
+/// Frames presented so far (`VICTORY_DRAW_CLAMP`'s allowance lasts one).
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

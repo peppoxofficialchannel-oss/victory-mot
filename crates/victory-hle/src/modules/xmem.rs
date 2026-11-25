@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -553,6 +553,71 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// After a write to physical pages through a view of their own
+/// ([`write_physical`], [`page_window`]): the title addresses those bytes
+/// are mapped at, each told to the GPU side as written
+/// (`victory_gpu::kernel_will_write`). Such a write goes around the title's
+/// mapping, so neither the guards on it (view memory) nor the kernel's
+/// write watch see it, and a host copy taken from that mapping before
+/// kept the old bytes for the rest of the run: the first gameplay room's
+/// walls, streamed in at the hand-over, drawn in about one run in four.
+/// `VICTORY_DSTORAGE_NOTIFY=1` turns it on (experiment).
+/// Views mapped or unmapped so far ([`map`], [`unmap`]): [`VIEW_INDEX`] is
+/// rebuilt when it changes.
+static VIEWS_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// [`Physical::views`] by section (its `Arc` address): each view's first
+/// page, end page and title address, as of [`VIEWS_CHANGED`]'s count.
+#[allow(clippy::type_complexity)]
+static VIEW_INDEX: LazyLock<Mutex<(u64, HashMap<usize, Vec<(usize, usize, usize)>>)>> =
+    LazyLock::new(|| Mutex::new((u64::MAX, HashMap::new())));
+
+pub(crate) fn wrote_physical(pages: &[usize], offset: usize, len: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_DSTORAGE_NOTIFY").as_deref() == Ok("1")) || len == 0 {
+        return;
+    }
+    let ranges: Vec<(usize, usize)> = {
+        let p = physical();
+        // Views by section (first page, end page, address), rebuilt only when
+        // a view was mapped or unmapped since: the streaming writes many
+        // pages a frame, the title maps rarely.
+        let mut index = VIEW_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = VIEWS_CHANGED.load(Ordering::Relaxed);
+        if index.0 != changed || index.1.is_empty() {
+            index.1.clear();
+            for (&at, (view_len, start)) in &p.views {
+                index
+                    .1
+                    .entry(Arc::as_ptr(&start.section) as usize)
+                    .or_default()
+                    .push((start.index, start.index + view_len / PAGE, at));
+            }
+            index.0 = changed;
+        }
+        let end = offset + len;
+        let mut out = Vec::new();
+        for (k, &page) in pages.iter().enumerate().take(end.div_ceil(PAGE)).skip(offset / PAGE) {
+            let Some(slice) = p.pages.get(&page) else { continue };
+            let Some(views) = index.1.get(&(Arc::as_ptr(&slice.section) as usize)) else {
+                continue;
+            };
+            // The bytes of this page the write covered.
+            let lo = offset.max(k * PAGE) - k * PAGE;
+            let hi = end.min((k + 1) * PAGE) - k * PAGE;
+            for &(first, last, at) in views {
+                if slice.index >= first && slice.index < last {
+                    out.push((at + (slice.index - first) * PAGE + lo, hi - lo));
+                }
+            }
+        }
+        out
+    };
+    for (at, n) in ranges {
+        victory_gpu::kernel_will_write(at, n);
+    }
+}
+
 /// Whether every page under `[offset, offset + len)` is known (a write that
 /// fails with them known is a host failure).
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
@@ -819,6 +884,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    VIEWS_CHANGED.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -896,6 +962,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        VIEWS_CHANGED.fetch_add(1, Ordering::Relaxed);
         for k in 0..size.div_ceil(PAGE) {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {

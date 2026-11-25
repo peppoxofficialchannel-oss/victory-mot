@@ -110,7 +110,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -687,16 +687,15 @@ fn emit_program(
         static_samplers: l
             .samplers
             .iter()
-            .enumerate()
-            .map(|(n, &w)| {
+            .map(|&(w, cmp)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if cmp {
                     s.filter |= 0x80;
                 }
                 s
             })
             .collect(),
-        samplers: l.samplers,
+        samplers: l.samplers.iter().map(|&(w, _)| w).collect(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
@@ -929,6 +928,10 @@ mod tests {
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        stores_v1_with(body, |p| p)
+    }
+
+    fn stores_v1_with(body: &[u32], form: impl FnOnce(ir::Program) -> ir::Program) -> Result<(), ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -965,13 +968,35 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let p = form(ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap());
         let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    #[test]
+    fn masked_vector_output_keeps_the_outer_restore_guard() {
+        for (nested, inner) in [
+            (false, &[0xBEFE_040C][..]),               // restore pre-branch EXEC
+            (true, &[0xBE90_246A, 0xBEFE_0410][..]),  // save and restore inner EXEC
+        ] {
+            let mut body = vec![
+                0x7E02_0287, // v_mov_b32 v1, 7
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0000 | (inner.len() as u32 + 1),
+            ];
+            body.extend_from_slice(inner);
+            body.extend([0x7E02_0289, 0xBEFE_040C]); // v1 = 9; restore outer EXEC
+            stores_v1_with(&body, |p| {
+                let walked = ir::without_skips(&p, true);
+                assert_eq!(walked.is_some(), nested);
+                walked.unwrap_or(p)
+            }).unwrap();
+        }
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
@@ -1338,7 +1363,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [7, 1, 1],
+                threads: [15, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -1366,21 +1391,53 @@ mod tests {
             v.validate(&mut dxil).unwrap();
         }
         #[cfg(windows)]
-        if let Ok(host) = super::host::Host::new(false) {
+        for warp in [false, true] {
+            let Ok(host) = super::host::Host::new(warp) else {
+                continue;
+            };
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
-                dxil,
-                user_data: l.user_data,
+                dxil: dxil.clone(),
+                user_data: l.user_data.clone(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
-                root_uavs: l.root_uavs,
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+                root_uavs: l.root_uavs.clone(),
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                7.0f32,
+                3.0,
+                -1.0,
+                1e-40,
+                1.0,
+                1e35,
+                1e-35,
+                1e-36,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                -1e35,
+                1e35,
+                0.0,
+                1.0,
+                -0.0,
+                1.0,
+                0.0,
+                -2.0,
+                1.0,
+                f32::INFINITY,
+                -1.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+                1e38,
+                1e-38,
+                -1e38,
+                1e-38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -1403,29 +1460,37 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
-            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
-            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
+            let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
+            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "warp={warp} got {:?}", got);
+            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits(), "warp={warp}");
             assert!(
                 (got[2] - 1e-35).abs() <= 1e-40,
-                "lane 2 got {:?} ({:#x})",
+                "warp={warp} lane 2 got {:?} ({:#x})",
                 got[2],
                 out[0][2]
             );
             assert!(
                 (got[3] - 10.0).abs() < 1e-5,
-                "lane 3 got {:?} ({:#x})",
+                "warp={warp} lane 3 got {:?} ({:#x})",
                 got[3],
                 out[0][3]
             );
-            assert_eq!(out[0][4], 0xFFC0_0000);
-            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert_eq!(out[0][4], 0xFFC0_0000, "warp={warp} 0/0");
+            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits(), "warp={warp} -1/0");
             assert!(
                 (got[6] - (-1.0)).abs() < 1e-6,
-                "lane 6 got {:?} ({:#x})",
+                "warp={warp} lane 6 got {:?} ({:#x})",
                 got[6],
                 out[0][6]
             );
+            assert_eq!(out[0][7], 0.0f32.to_bits(), "warp={warp} +0/1");
+            assert_eq!(out[0][8], (-0.0f32).to_bits(), "warp={warp} -0/1");
+            assert_eq!(out[0][9], (-0.0f32).to_bits(), "warp={warp} +0/-2");
+            assert_eq!(out[0][10], 0.0f32.to_bits(), "warp={warp} 1/+Inf");
+            assert_eq!(out[0][11], (-0.0f32).to_bits(), "warp={warp} -1/+Inf");
+            assert_eq!(out[0][12], 0xFFC0_0000, "warp={warp} +Inf/+Inf");
+            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
+            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
         }
     }
 }
@@ -1551,6 +1616,11 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with(words, input_addr, false)
+    }
+
+    /// `pixel`, with TEXCOORD0 held as 16-bit values when `fp16`.
+    fn pixel_with(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1564,7 +1634,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1664,6 +1734,26 @@ mod barycentric_tests {
         let (features, inputs) = parts(&shader);
         assert_eq!(features & 0x2_0000, 0);
         assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// An f16 interpolation's first half keeps no value of its own (the second half writes
+    /// another VGPR and recomputes it). A `v_fma_mixlo_f16` into that VGPR keeps its high
+    /// half: zero then, as for other 16-bit writes, and the program translates.
+    /// Eight of the title's deferred material pixel programs do this.
+    #[test]
+    fn mixlo_over_an_f16_first_interpolation_half() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xD742_0003, 0x0002_0000, // v_interp_p1ll_f16 v3, v0, attr0.x
+            0xD75A_0002, 0x040E_0200, // v_interp_p2_f16 v2, v1, attr0.x, v3
+            0xCC21_0003, 0x0A02_0502, // v_fma_mixlo_f16 v3, v2, v2, 0
+            0x7E08_1703,              // v_cvt_f32_f16 v4, v3
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel_with(&words, PERSP_CENTER, true).unwrap();
         validate(&shader);
     }
 

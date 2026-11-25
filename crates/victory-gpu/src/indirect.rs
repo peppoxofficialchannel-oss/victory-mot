@@ -991,7 +991,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1019,6 +1019,28 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every lane's slice is hashed: first byte of piece 0 (lane 0),
+        // last byte of piece 2 (lane 63), and swapping two 16-byte blocks
+        // across lanes in piece 1 must all be detected.
+        for &(offset, expected) in &[
+            (0usize, [1, 0, 0]),
+            (PIECE * 3 - 1, [0, 0, 1]),
+            (63 * 16 + 7, [1, 0, 0]),
+        ] {
+            // SAFETY: offset is inside the mapped buffer.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset] ^ 0x01) };
+            assert_eq!(run(&mut warp, 1), expected);
+            // SAFETY: restore original byte.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset]) };
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
+        // Swap lane 0's first 16 bytes with lane 1's first 16 bytes in piece 1.
+        // SAFETY: both 16-byte blocks are inside piece 1 of the mapped buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content[PIECE + 16..PIECE + 32].as_ptr(), now_ptr.add(PIECE), 16);
+            std::ptr::copy_nonoverlapping(content[PIECE..PIECE + 16].as_ptr(), now_ptr.add(PIECE + 16), 16);
+        }
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software

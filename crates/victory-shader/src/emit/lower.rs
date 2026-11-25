@@ -50,13 +50,14 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
-    pub samplers: Vec<[u32; 4]>,
+    /// Immediate samplers in slot order: their four words, and whether the
+    /// slot is a comparison sampler (a sampler used both ways holds two
+    /// slots, one for each way).
+    pub samplers: Vec<([u32; 4], bool)>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
@@ -201,7 +202,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -1036,7 +1037,8 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
-pub(super) fn host_max_wave() -> u32 {
+/// The maximum wave width selected for shader translation.
+pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
@@ -1878,7 +1880,7 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -2277,11 +2279,9 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
-            cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
@@ -6280,18 +6280,23 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // A comparison use needs a comparison sampler on the host
+                // (the DXIL validator requires the kinds to match), so a
+                // sampler used both ways gets one slot for each way.
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().position(|&(w, c)| w == words && c == cmp) {
                     Some(n) => n,
                     None => {
-                        self.samplers.push(words);
+                        self.samplers.push((words, cmp));
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
+                let bit = 1 << n;
+                self.s.cmp_samplers = if cmp {
+                    self.s.cmp_samplers | bit
+                } else {
+                    self.s.cmp_samplers & !bit
+                };
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -7115,16 +7120,19 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
+                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                // Priority (highest to lowest): n_nan, d_nan, invalid (0/0 or
+                // Inf/Inf), make_inf (n_inf or d_zero), make_zero (d_inf or
+                // n_zero), q_nan (overflowed quotient -> signed Inf), signed_q.
+                // `q_nan` must stay below `make_zero` because `v_div_scale_f32`
+                // and `v_fma_f32(-Inf, 0, 1)` produce qNaN on `0 / x` and `x / Inf`.
+                let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);
@@ -7334,9 +7342,11 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // An old value with none of its own (a first interpolation half the second
+                // half recomputes) keeps zero, as in `write_half`.
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.i32(0),
                 };
                 let h = self
                     .s
@@ -8216,7 +8226,7 @@ impl<'a> Lower<'a> {
             let t = self.binary(35, a, lo);
             let t = self.binary(36, t, hi);
             let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-            let nan = self.s.m.cmp(c, pred::UNO, a, a);
+            let nan = self.is_nan_f32(a);
             let z = self.s.m.i32(0);
             let r = self.s.m.select(c, nan, z, r);
             return self.write_half(inst, r, guard);
@@ -9761,13 +9771,34 @@ impl<'a> Lower<'a> {
                 *o = zero;
             }
             if offset_word && offsets > 0 {
-                let w = addr_val(self, 0)?;
-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
-                    // Bits at..at+5 sign-extended: shift up, then down.
-                    let left = self.s.m.i32(at);
-                    let t = self.s.m.bin(c, Bin::Shl, w, left);
-                    let k26 = self.s.m.i32(26);
-                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                // The offset word is always 32-bit (6-bit signed X/Y/Z in bits
+                // 0..5, 8..13, 16..21), even under `a16`. DXIL `sample*` ops
+                // require immediate constant offsets in -8..=7; fold constant
+                // words in range directly, and keep dynamic extraction for
+                // programmable gathers / out-of-range offsets.
+                let w = addr_u32(self, 0)?;
+                let folded = self.s.m.int_value(w).and_then(|w| {
+                    let w = w as u32;
+                    let fields: Vec<i32> = (0..offsets)
+                        .map(|k| {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            if x >= 32 { x - 64 } else { x }
+                        })
+                        .collect();
+                    fields.iter().all(|&f| (-8..=7).contains(&f)).then_some(fields)
+                });
+                if let Some(fields) = folded {
+                    for (o, f) in os.iter_mut().zip(fields) {
+                        *o = self.s.m.i32(f as u32);
+                    }
+                } else {
+                    for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                        // Bits at..at+5 sign-extended: shift up, then down.
+                        let left = self.s.m.i32(at);
+                        let t = self.s.m.bin(c, Bin::Shl, w, left);
+                        let k26 = self.s.m.i32(26);
+                        os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                    }
                 }
             }
             let mut args = vec![h, sh];
@@ -9801,27 +9832,6 @@ impl<'a> Lower<'a> {
                     )
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     self.s
@@ -9891,11 +9901,10 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL unary opcode 23 (`Log`) is base-2 log (`log2`); a
+                    // length of 0 gives minus infinity, which the sampler
+                    // clamps to level 0.
+                    let lod = self.unary(23, texels);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

@@ -1105,6 +1105,9 @@ fn into_destination(
         // #571). After a decode that failed part way too: what it wrote
         // is there.
         super::xmem::pages_written(pages, offset, len);
+        // Written around the title's mapping: tell the GPU side where the
+        // title sees these bytes (`wrote_physical`, `VICTORY_DSTORAGE_NOTIFY`).
+        super::xmem::wrote_physical(pages, offset, len);
         return filled;
     }
     let mut data = vec![0; len];
@@ -1143,6 +1146,7 @@ fn into_destination(
         }
         // As above, after the write that succeeded.
         super::xmem::pages_written(pages, offset, n);
+        super::xmem::wrote_physical(pages, offset, n);
         Ok(())
     } else {
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
