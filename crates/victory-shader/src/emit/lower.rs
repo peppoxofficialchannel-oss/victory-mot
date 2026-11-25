@@ -436,9 +436,10 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
+/// Per IR block: every lane of the wave that started the program runs it, as often as the others
+/// – no per-lane branch separates it from the entry (it lies in no lane branch's region: the
+/// blocks reachable from the branch that do not post-dominate it, and the blocks of a loop the
+/// branch leaves). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
@@ -451,7 +452,8 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
+/// not post-dominate it, and those of a loop it leaves, which only some lanes run (or run
+/// again). Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
@@ -491,6 +493,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             }
         }
     }
+    let loops = natural_loops(&succ);
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
@@ -507,9 +510,72 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
+        // A lane branch that leaves a loop (its own back edge, a break): each lane leaves on
+        // its own, and the loop's blocks, the branch's own among them, are run again only by
+        // the lanes that stayed, though some post-dominate it.
+        for body in loops.iter().filter(|l| l[d] && succ[d].iter().any(|&s| !l[s])) {
+            for b in (0..n).filter(|&b| body[b]) {
+                seen[b] = true;
+            }
+        }
         regions.push((d, seen));
     }
     Some(regions)
+}
+
+/// The natural loops of the blocks `succ` links (each block's successors, block 0 the entry),
+/// one per header: the header and every block that reaches one of its back edges without
+/// passing through it. A back edge goes to a block no later in reverse postorder (the program
+/// is reducible: `ir::build` splits irreducible loops).
+fn natural_loops(succ: &[Vec<usize>]) -> Vec<Vec<bool>> {
+    let n = succ.len();
+    // reverse postorder of the reachable blocks
+    let mut rpo = vec![usize::MAX; n];
+    let (mut seen, mut post, mut stack) = (vec![false; n], Vec::new(), vec![(0usize, 0usize)]);
+    if n > 0 {
+        seen[0] = true;
+    }
+    while let Some(top) = stack.last_mut() {
+        let (b, i) = *top;
+        top.1 += 1;
+        match succ[b].get(i) {
+            Some(&s) if !seen[s] => {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+            Some(_) => {}
+            None => {
+                post.push(b);
+                stack.pop();
+            }
+        }
+    }
+    for (k, &b) in post.iter().rev().enumerate() {
+        rpo[b] = k;
+    }
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, s) in succ.iter().enumerate() {
+        for &t in s {
+            pred[t].push(b);
+        }
+    }
+    let mut loops: HashMap<usize, Vec<bool>> = HashMap::new();
+    for (q, s) in succ.iter().enumerate() {
+        for &h in s.iter().filter(|&&h| rpo[q] != usize::MAX && rpo[h] <= rpo[q]) {
+            let body = loops.entry(h).or_insert_with(|| {
+                let mut v = vec![false; n];
+                v[h] = true;
+                v
+            });
+            let mut stack = vec![q];
+            while let Some(b) = stack.pop() {
+                if !std::mem::replace(&mut body[b], true) {
+                    stack.extend(pred[b].iter().copied());
+                }
+            }
+        }
+    }
+    loops.into_values().collect()
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -11620,6 +11686,48 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn a_loop_each_lane_leaves_on_its_own_is_no_code_every_lane_runs() {
+        // The waterfall loop in one block, its branch back on the lanes still
+        // waiting: every lane runs its first pass, only those still waiting
+        // the next ones, so two host waves cannot meet there.
+        use crate::resource::tests::cmpx_waterfall;
+        for wave64 in [false, true] {
+            let words = cmpx_waterfall(wave64, true);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, wave64, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            let looped = (0..p.blocks.len())
+                .find(|&b| matches!(st.exits[b], crate::structure::LaneExit::Branch { taken, .. } if taken == b))
+                .expect("a block that branches back to itself");
+            assert!(!all[looped], "wave64 {wave64}");
+            // The code before the loop and after it still is.
+            assert!(all[0], "wave64 {wave64}");
+            assert!(all[p.blocks.len() - 1], "wave64 {wave64}");
+        }
+        // A loop that goes round on a scalar count, with a lane branch inside it that does
+        // not leave it: only the branch's own arm is code not every lane runs.
+        let words = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0 (byte 4: the loop)
+            0xBE87_3C6A, // s_and_saveexec_b32 s7, vcc_lo
+            0xBF88_0001, // s_cbranch_execz (past the arm)
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (byte 16: the arm)
+            0x887E_077E, // s_or_b32 exec_lo, exec_lo, s7 (byte 20)
+            0x8006_8106, // s_add_u32 s6, s6, 1
+            0xBF07_8406, // s_cmp_lg_u32 s6, 4
+            0xBF85_FFF8, // s_cbranch_scc1 (back to byte 4)
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let at = |offset| (0..p.blocks.len()).find(|&b| p.blocks[b].offset == offset).unwrap();
+        assert!(all[at(4)] && all[at(20)] && !all[at(16)]);
     }
 
     #[test]
