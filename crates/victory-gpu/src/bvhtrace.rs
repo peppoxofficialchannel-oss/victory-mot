@@ -3,8 +3,10 @@
 //! (`VICTORY_BVH_TRACE=<file>`, diagnostics builds only). One line per
 //! event, each led by the frame number:
 //!
-//! - `D`: a dispatch of such a program (its shader hash, group counts, root
-//!   constants, root views with the first 64 bytes of title memory there);
+//! - `D`: a dispatch of such a program (its shader hash, group counts, then
+//!   `threads XxYxZ` for one by thread counts whose last groups are cut
+//!   short, root constants, root views with the first 64 bytes of title
+//!   memory there);
 //! - `N`: a copy given a number in the directory of title memory by
 //!   address (`crate::memory`), with why;
 //! - `F`: the pages shaders touched that had no copy;
