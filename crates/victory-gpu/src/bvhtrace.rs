@@ -13,7 +13,8 @@
 //!   first bytes;
 //! - `V`: what walking the structures the builder made on the card found,
 //!   `V rebuilt` for those it rebuilt in place from what was streamed
-//!   (`VICTORY_BVH_CHECK`, [`check_stages`]).
+//!   (`VICTORY_BVH_CHECK`, [`check_stages`]), once their header was put
+//!   back (`late`: walked with no put-back seen, [`check_due`]).
 //!
 //! The file is written unbuffered: a run that ends in the title's crash
 //! keeps every line written before it.
@@ -133,9 +134,17 @@ pub(crate) fn rebuild_stage() -> Option<&'static str> {
     check_stages().get(1).map(String::as_str)
 }
 
-/// Headers named, by the frame they were named in, and whether the
-/// structure is rebuilt in place.
-static NAMED: Mutex<Vec<(u64, u64, bool)>> = Mutex::new(Vec::new());
+/// A header named: the frame it was named in, its address, whether the
+/// structure is rebuilt in place, and the frame the first put-back over the
+/// header after that landed in (0: none yet; [`put_back`]).
+type Named = (u64, u64, bool, u64);
+
+/// Headers named and not walked yet.
+static NAMED: Mutex<Vec<Named>> = Mutex::new(Vec::new());
+
+/// Frames after which a structure is walked even though no put-back over
+/// its header was seen (counted as `late` in its `V` line).
+const LATE: u64 = 16;
 
 /// Notes the structure a rebuilding stage starts on, whose header is at
 /// `header` ([`rebuild_stage`]).
@@ -143,7 +152,27 @@ pub(crate) fn rebuilt_named(header: u64) {
     let frame = crate::frame::current();
     let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
     if header != 0 && named.len() < 1 << 16 {
-        named.push((frame, header, true));
+        named.push((frame, header, true, 0));
+    }
+}
+
+/// Title memory `at`..`at + len` was put back from what shaders wrote:
+/// structures named before, whose header lies there, can be walked from the
+/// next frame on. The walk reads title memory, which holds the builder's
+/// writes only once they are put back after their submission ends, a frame
+/// or more after the dispatches were traced (run integ-general-2-rt2-builder:
+/// a structure rebuilt in frame 3255 was walked at the start of 3256 still
+/// in its streamed form, and put back a few lines later).
+pub(crate) fn put_back(at: u64, len: u64) {
+    if check_stages().is_empty() {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    for n in named.iter_mut() {
+        if n.3 == 0 && n.0 <= frame && (at..at.saturating_add(len)).contains(&n.1) {
+            n.3 = frame;
+        }
     }
 }
 /// The frame [`check_due`] last ran in.
@@ -162,7 +191,7 @@ pub(crate) fn headers_named(records: u64, count: u32) {
     for record in bytes.chunks_exact(40) {
         let header = u64::from_le_bytes(record[0..8].try_into().unwrap_or_default());
         if header != 0 && named.len() < 1 << 16 {
-            named.push((frame, header, false));
+            named.push((frame, header, false, 0));
         }
     }
 }
@@ -177,6 +206,8 @@ struct Walk {
     triangles: u64,
     instances: u64,
     bad: u64,
+    /// Structures walked with no put-back over their header seen ([`LATE`]).
+    late: u64,
     /// The first problems, with where.
     first: Vec<String>,
 }
@@ -203,7 +234,16 @@ fn inside(b: &[f32; 6], outer: &[f32; 6]) -> bool {
 /// inverted and inside its parent's box (the root's inside the header's
 /// bounds), every triangle's vertices finite and inside their box, every
 /// node inside the structure's size and reached once.
-fn walk(header: u64, w: &mut Walk) {
+///
+/// The nodes of a structure `rebuilt` in place are not in the header's
+/// space: the leaf rehydration writes each vertex as (M v - o) s, with o
+/// and s from its root constants (dwords 0-2 and 4-6, s powers of two such
+/// as 2^18, 2^18, 2^17), and the boxes above are made from those vertices,
+/// while the header keeps the bounds in the structure's own space. Their
+/// root is not held to the header's bounds (in run
+/// integ-general-2-rt2-builder every root child "outside" them was exactly
+/// that scale, axis by axis).
+fn walk(header: u64, rebuilt: bool, w: &mut Walk) {
     let mut h = [0u8; 64];
     if !crate::host::read_into(header as *const u8, &mut h) {
         w.unreadable += 1;
@@ -223,7 +263,8 @@ fn walk(header: u64, w: &mut Walk) {
         w.bad(header, header, &format!("header bounds {bounds:?}"));
     }
     let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![(root, bounds)];
+    let everywhere = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY, f32::INFINITY];
+    let mut stack = vec![(root, if rebuilt { everywhere } else { bounds })];
     let mut nodes = 0u32;
     while let Some((pointer, outer)) = stack.pop() {
         nodes += 1;
@@ -298,9 +339,12 @@ fn walk(header: u64, w: &mut Walk) {
     }
 }
 
-/// Walks the structures named a frame or more before this one, once a
-/// frame, and says what it found in a `V` line for those built on the card
-/// and a `V rebuilt` line for those rebuilt in place.
+/// Walks, once a frame, the structures whose header was put back in an
+/// earlier frame after they were named ([`put_back`]; or named [`LATE`]
+/// frames ago with no put-back seen), and says what it found in a `V` line
+/// for those built on the card and a `V rebuilt` line for those rebuilt in
+/// place. A structure the title rebuilds every frame may still change
+/// under the walk: the next frame's put-back runs on another thread.
 fn check_due() {
     if check_stages().is_empty() {
         return;
@@ -309,33 +353,40 @@ fn check_due() {
     if CHECKED.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
-    let due: Vec<(u64, bool)> = {
+    // (header, rebuilt, late)
+    let due: Vec<(u64, bool, bool)> = {
         let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
-        let (due, later): (Vec<_>, Vec<_>) = named.drain(..).partition(|&(at, _, _)| at < frame);
+        let (due, later): (Vec<_>, Vec<_>) = named
+            .drain(..)
+            .partition(|&(at, _, _, landed)| (landed != 0 && landed < frame) || at + LATE < frame);
         *named = later;
-        let mut due: Vec<(u64, bool)> = due.into_iter().map(|(_, h, rebuilt)| (h, rebuilt)).collect();
+        let mut due: Vec<(u64, bool, bool)> =
+            due.into_iter().map(|(_, h, rebuilt, landed)| (h, rebuilt, landed == 0)).collect();
         due.sort_unstable();
-        due.dedup();
+        due.dedup_by_key(|d| (d.0, d.1));
         due
     };
     for rebuilt in [false, true] {
-        let headers: Vec<u64> = due.iter().filter(|d| d.1 == rebuilt).map(|d| d.0).collect();
+        let headers: Vec<(u64, bool)> = due.iter().filter(|d| d.1 == rebuilt).map(|d| (d.0, d.2)).collect();
         if !headers.is_empty() {
-            walk_line(&headers, if rebuilt { "V rebuilt" } else { "V" });
+            walk_line(&headers, rebuilt);
         }
     }
 }
 
-/// Walks the structures at `headers` and says what it found in a line led
-/// by `kind`.
-fn walk_line(headers: &[u64], kind: &str) {
+/// Walks the structures at `headers` (each with whether it is walked
+/// late) and says what it found in a `V` line (`V rebuilt` for structures
+/// `rebuilt` in place).
+fn walk_line(headers: &[(u64, bool)], rebuilt: bool) {
     let mut w = Walk::default();
-    for &header in headers {
-        walk(header, &mut w);
+    for &(header, late) in headers {
+        w.late += u64::from(late);
+        walk(header, rebuilt, &mut w);
     }
+    let kind = if rebuilt { "V rebuilt" } else { "V" };
     line(|| {
         format!(
-            "{kind} structures {} empty {} unreadable {} box nodes {} triangles {} instances {} bad {}{}",
+            "{kind} structures {} empty {} unreadable {} box nodes {} triangles {} instances {} bad {} late {}{}",
             w.structures,
             w.empty,
             w.unreadable,
@@ -343,6 +394,7 @@ fn walk_line(headers: &[u64], kind: &str) {
             w.triangles,
             w.instances,
             w.bad,
+            w.late,
             w.first
                 .iter()
                 .map(|f| format!(" | {f}"))

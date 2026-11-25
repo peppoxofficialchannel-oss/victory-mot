@@ -7487,16 +7487,19 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
-        return;
+    if len != 0 && !write(dst as usize, len) {
+        for_pieces(dst as usize, len, 64 << 10, |at, n| {
+            if !write(at, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    write(at, n);
+                });
+            }
+        });
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
-    });
+    #[cfg(feature = "diagnostics")]
+    if crate::bvhtrace::armed() {
+        crate::bvhtrace::put_back(dst as u64, len as u64);
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
