@@ -7645,10 +7645,28 @@ impl Host {
     }
 }
 
+/// Whether presents go through an sRGB swap chain (`VICTORY_PRESENT_SRGB=1`),
+/// an experiment on the composite's colour: the saturations measured on saved
+/// frames fall as brightness rises, which is what a transfer function read the
+/// wrong way looks like. Off by default.
+fn present_srgb() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_SRGB").is_some_and(|v| v == "1"))
+}
+
+/// Set once a swap chain has refused an sRGB format ([`Host::presenter`], or
+/// the buffers made again in [`Host::present_now`]): presents then go
+/// through `_UNORM`, as they always did, and never ask again.
+static SRGB_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The swap chain formats a presented texture can be copied into: its own
-/// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+/// family's. With `srgb` (the [`present_srgb`] switch) the 8-bit family is
+/// presented through `_UNORM_SRGB`, so the same bytes are read as sRGB-encoded
+/// and the display shows them as they were meant to be seen; every other
+/// family is left as it is.
+fn host_swap_format(format: DXGI_FORMAT, srgb: bool) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
+        27..=32 if srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
         23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -7995,15 +8013,24 @@ impl Host {
     fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
+        let Some(mut format) = host_swap_format(desc.Format, present_srgb()) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
+        // A swap chain that refused the sRGB format (made below, or its
+        // buffers made again further down) presents through `_UNORM`.
+        if format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && SRGB_REFUSED.load(Ordering::Acquire) {
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    // The swap chain may have fallen back to `_UNORM`.
+                    format = p.format;
+                    Some(p)
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
                     return None;
@@ -8015,10 +8042,34 @@ impl Host {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
+            let mut resized = unsafe {
                 p.swap_chain
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
+            if format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                && let Err(e) = &resized
+            {
+                // Some configurations take no sRGB buffers: present through
+                // `_UNORM` as before rather than lose the frames.
+                tracing::warn!(
+                    error = %e,
+                    width,
+                    height,
+                    "the swap chain refused sRGB buffers: presenting through _UNORM"
+                );
+                SRGB_REFUSED.store(true, Ordering::Release);
+                format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                // SAFETY: as above.
+                resized = unsafe {
+                    p.swap_chain.ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                };
+            }
             match resized {
                 Ok(()) => {
                     (p.width, p.height, p.format) = (width, height, format);
@@ -8118,7 +8169,7 @@ impl Host {
         &self,
         width: u32,
         height: u32,
-        format: DXGI_FORMAT,
+        mut format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
@@ -8128,7 +8179,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let mut desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
                 Format: format,
@@ -8141,9 +8192,27 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let swap_chain =
+                match factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None) {
+                    Ok(chain) => chain.cast::<IDXGISwapChain3>()?,
+                    Err(e) if format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => {
+                        // Some configurations offer no sRGB flip model: present
+                        // through `_UNORM`, as before, and say so.
+                        tracing::warn!(
+                            error = %e,
+                            width,
+                            height,
+                            "the swap chain refused sRGB: presenting through _UNORM"
+                        );
+                        SRGB_REFUSED.store(true, Ordering::Release);
+                        format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                        desc.Format = format;
+                        factory
+                            .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                            .cast::<IDXGISwapChain3>()?
+                    }
+                    Err(e) => return Err(e),
+                };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -8603,6 +8672,37 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod srgb {
+    use super::host_swap_format;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+    };
+
+    /// The switch only reaches the 8-bit family, and only when it is on;
+    /// every other family is presented as it was, and an unknown format is
+    /// still nothing to present with.
+    #[test]
+    fn the_switch_only_reaches_the_eight_bit_family() {
+        let eight_bit = DXGI_FORMAT(28);
+        assert_eq!(
+            host_swap_format(eight_bit, false),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            host_swap_format(eight_bit, true),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+        );
+        assert_eq!(
+            host_swap_format(DXGI_FORMAT(10), true),
+            Some(DXGI_FORMAT_R16G16B16A16_FLOAT),
+            "the 16-bit family is not touched"
+        );
+        assert_eq!(host_swap_format(DXGI_FORMAT(0), true), None);
     }
 }
 
