@@ -100,7 +100,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     text.trim_end().to_owned()
 }
 
-/// `VICTORY_BVH_CHECK=<hash>[,<hash>]`: the builder stages whose structures
+/// `VICTORY_BVH_CHECK=<hash>[,<hash>]` (or `+` between them, for scripts
+/// that split their switches at commas): the builder stages whose structures
 /// are walked a frame later ([`check_due`]), a `V` line saying what was
 /// found. The first writes structure headers (InitHeaders: its first root
 /// view is an array of 40-byte records in list upload memory, each naming a
@@ -115,7 +116,7 @@ fn check_stages() -> &'static [String] {
         std::env::var("VICTORY_BVH_CHECK")
             .ok()
             .filter(|_| on())
-            .map(|v| v.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect())
+            .map(|v| v.split([',', '+']).map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect())
             .unwrap_or_default()
     })
 }
