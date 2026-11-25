@@ -8127,6 +8127,18 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // The card's memory as the system counts it, every cadence. The
+            // assemblea of 26/11 00:10: 6 GB for this title may be short of
+            // its budget, and a frame inflated by spilling reads as GPU work
+            // when it is a stall. This is the number that says which.
+            if let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) {
+                tracing::info!(
+                    "the card's memory: {} MB of {} MB in use ({:.0}%)",
+                    used >> 20,
+                    budget >> 20,
+                    100.0 * used as f64 / budget.max(1) as f64
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::loop_notes::log();
