@@ -247,6 +247,10 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Shader translation over the title's whole shader pack, RTX 5090 (32-lane waves), `victory translate --validate --pipelines`: 25,682 of 25,953 programs translate, validate and get a pipeline, against 25,452 at 9376fd6 (compute 2,729 of 2,734, mesh 8,694 of 8,765, pixel all 12,067, vertex all 2,192). What is left: the 195 unused voxel geometry stages, five ray-trace programs, and 71 mesh programs as translated alone (linked for their pipelines, below).
+- Console wave64 compute programs on a GPU with 32-lane waves run in a paired form where the host refused them (they asked for 64-lane waves) or where only an approximate per-half form took them: one host wave for each console wave, each thread two of its lanes. The screen-space tracing tiles, particles, decal trails, hair shadow masks and three structure-builder programs get pipelines, and 36 programs in which each half-wave counted, ORed or elected over its own 32 lanes run as on the console, at about 2.9 times their DXIL size (not timed in a run yet). `VICTORY_WAVE_PAIRS=0` turns it off.
+- Mesh programs whose outputs pass D3D12's 32 KiB as translated alone (71: pedestrian, vehicle and prop transforms) are linked with the pixel program of each pipeline, so that the mesh program writes only what that program reads (`VICTORY_MESH_LINK=0` turns it off). Offline, 710 such pairs link, validate and get a pipeline.
+- Also translated now: a float beside an integer or the front face in one signature register (one interpolation mode per register, rows in the validator's order), immediate samplers chosen by a uniform branch, pixel programs ordered by primitive (on rasterizer-ordered views), whole-wave sections that a jump splits, 64-bit floats and their wave sums, descriptors read only for their size, a subtraction on group-shared memory (NVIDIA refuses the atomic; a compare-exchange loop). Loops of ray-testing programs stop at 1,024 iterations while the builder is off (shadow mask 11.7 → 2.4 ms a frame).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -418,6 +422,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
