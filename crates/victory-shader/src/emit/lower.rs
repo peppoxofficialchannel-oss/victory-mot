@@ -315,6 +315,11 @@ struct Lower<'a> {
     /// With loop notes ([`super::loop_notes`]): each counted loop's number in
     /// its program's notes (`shader::SLOT_LOOPS`), by header IR block.
     notes: Option<HashMap<usize, u32>>,
+    /// A pixel program that reads first lanes (`v_readfirstlane_b32`): what
+    /// scalar code makes of such a read may differ in helper lanes
+    /// ([`Self::helper_own`]), so every heap index is taken as one that may
+    /// differ between lanes.
+    helper_scalars: bool,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -1458,6 +1463,8 @@ impl<'a> Lower<'a> {
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             notes: None,
+            helper_scalars: x.native.stage == HwStage::Ps
+                && p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -4409,7 +4416,33 @@ impl<'a> Lower<'a> {
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+    /// A helper lane of a pixel shader takes its own `x` ([`Self::helper_own`]).
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
+        let (first, any) = self.first_lane_of_wave(x, guard);
+        (self.helper_own(x, first), any)
+    }
+
+    /// `first`, a first-lane read of `x`, or in a helper lane of a pixel shader `x` itself.
+    /// The console runs a pixel program's helper lanes as lanes of EXEC (whole-quad mode,
+    /// `s_wqm`), so a waterfall loop serves a helper lane in a pass of its own, with its own
+    /// descriptor. The host's wave operations leave helper lanes out (SM 6.6) and give them
+    /// undefined results: on an RTX 5090 a helper lane whose value no other lane of its wave
+    /// held never met it as the first lane, went round to the iteration limit and left with
+    /// what the loop computes never set (`loop_tests`), and its quad's derivatives read that
+    /// (the character skin and cloth program `94d281151ca58b4f` samples its layers in nine
+    /// such nested loops).
+    fn helper_own(&mut self, x: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let i1t = self.s.t.i1;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1t, 221, &[]);
+        self.s.m.select(c, helper, x, first)
+    }
+
+    /// [`Self::first_lane`] as the host's wave operations see the wave.
+    fn first_lane_of_wave(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
@@ -5936,7 +5969,8 @@ impl<'a> Lower<'a> {
             if per_lane {
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                d = self.helper_own(d, first);
             }
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
@@ -6200,8 +6234,9 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 // A waterfall loop's load at the first lane's offset reads
-                // each lane's own entry (see `resource::Waterfall`).
-                let per_lane = self.x.res.waterfall.loads.contains(load);
+                // each lane's own entry (see `resource::Waterfall`); in a
+                // pixel program a helper lane may have an offset of its own.
+                let per_lane = self.x.res.waterfall.loads.contains(load) || self.helper_scalars;
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
@@ -6274,7 +6309,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, self.helper_scalars, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6292,7 +6327,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, index, sampler, self.helper_scalars, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop

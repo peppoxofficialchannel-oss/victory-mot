@@ -1,13 +1,17 @@
-//! End-to-end tests of translated loops: the iteration limit and the loop
-//! notes (`shader::SLOT_LOOPS`). Synthetic GFX10 compute programs lowered to
-//! DXIL, validated by `dxil.dll` when present, and run on the host GPU and
-//! WARP.
+//! End-to-end tests of translated loops: the iteration limit, the loop notes
+//! (`shader::SLOT_LOOPS`) and loops over the wave's lanes in pixel programs.
+//! Synthetic GFX10 programs lowered to DXIL, validated by `dxil.dll` when
+//! present, and run on the host GPU and WARP.
 
-use super::host::{Dispatch, Host, Root, View};
-use super::lower::{COMPUTE_LOOP_LIMIT, TEST_NOTES};
+use super::bitcode::{Attr, Term};
+use super::container::SigElement;
+use super::host::{Dispatch, Draw, Host, Root, View};
+use super::lower::{self, COMPUTE_LOOP_LIMIT, TEST_NOTES};
+use super::shader::Shader;
 use super::valu_tests::{ONE_AT_A_TIME, build_cs, s_mov_b32, sgpr, sop2, vop1};
-use super::{HostShader, LOOP_NOTE_DWORDS, LOOP_NOTES, SLOT_LOOPS};
-use crate::native::RootType;
+use super::{HostShader, LOOP_NOTE_DWORDS, LOOP_NOTES, SLOT_LOOPS, validator};
+use crate::native::{HwStage, NativeProgram, RootType, StageIo};
+use crate::{io, ir, resource, structure};
 
 /// `s_add_u32 s6, s6, 1`.
 const S_ADD_S6_1: u32 = sop2(0x00, 6, 6, 0x81);
@@ -124,4 +128,167 @@ fn a_loop_that_ends_leaves_no_note() {
         assert_eq!(stored, 5, "{label}");
         assert!(notes.iter().all(|&w| w == 0), "{label}: {notes:?}");
     }
+}
+
+/// A signature element of four floats in row 0.
+fn element(name: &str, kind: u8, interp: u8, usage: u8) -> SigElement {
+    SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage,
+        half: false,
+    }
+}
+
+fn host_shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
+    HostShader {
+        stage,
+        dxil,
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+    }
+}
+
+/// A vertex shader that passes `POSITION` through as `SV_Position`.
+fn position_vs() -> HostShader {
+    let mut vs = Shader::new(false);
+    vs.inputs = vec![element("POSITION", 0, 0, 15)];
+    vs.outputs = vec![element("SV_Position", 3, 4, 15)];
+    let b = vs.entry;
+    for col in 0..4 {
+        let args = [vs.m.i32(0), vs.m.i32(0), vs.m.i8(col), vs.m.undef(vs.t.i32)];
+        let v = vs.op(b, "loadInput.f32", Attr::ReadNone, vs.t.f32, 4, &args);
+        let args = [vs.m.i32(0), vs.m.i32(0), vs.m.i8(col), v];
+        vs.op(b, "storeOutput.f32", Attr::NoUnwind, vs.t.void, 5, &args);
+    }
+    vs.m.terminate(b, Term::Ret);
+    host_shader(HwStage::Vs, vs.finish())
+}
+
+/// A wave32 pixel program that reads the pixel's position (x in v0, y in
+/// v1) and exports target 0.
+fn pixel(words: &[u32]) -> HostShader {
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 16,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 1 << 8 | 1 << 9,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, false, 16).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![element("SV_Position", 3, 4, 3)],
+        outputs: vec![element("SV_Target", 16, 0, 15)],
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    host_shader(HwStage::Ps, lowered.dxil)
+}
+
+/// The console's waterfall over a value each lane has its own of (here the
+/// pixel's number, `x + 8 y`), counting the passes each lane is served in,
+/// and the count of the lane across the quad's x (`quad_perm:[1,0,3,2]`),
+/// exported as (own, across, own, across).
+const WATERFALL_OVER_PIXELS: [u32; 21] = [
+    0xBEFE_097E, // s_wqm_b32 exec_lo, exec_lo
+    0x7E04_0F00, // v_cvt_u32_f32 v2, v0
+    0x7E06_0F01, // v_cvt_u32_f32 v3, v1
+    0x3406_0683, // v_lshlrev_b32 v3, 3, v3
+    0x4A04_0702, // v_add_nc_u32 v2, v2, v3
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xBE84_037E, // s_mov_b32 s4, exec_lo
+    0xBE82_037E, // s_mov_b32 s2, exec_lo
+    // the loop (byte 32): the first lane's value, the lanes that hold it
+    0x7E06_0502, // v_readfirstlane_b32 s3, v2
+    0x7DA4_0403, // v_cmpx_eq_u32 exec_lo, s3, v2
+    0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+    0xBE82_4702, // s_andn2_wrexec_b32 s2, s2
+    0xBF89_FFFB, // s_cbranch_execnz (the loop)
+    0xBEFE_0304, // s_mov_b32 exec_lo, s4
+    0x7E0A_02FA, // v_mov_b32_dpp v5, v4 quad_perm:[1,0,3,2]
+    0xFF00_B104,
+    0x7E08_0D04, // v_cvt_f32_u32 v4, v4
+    0x7E0A_0D05, // v_cvt_f32_u32 v5, v5
+    0xF800_180F, // exp mrt0, v4, v5, v4, v5 done vm
+    0x0504_0504,
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_helper_lane_is_served_by_a_waterfall_loop_in_a_pass_of_its_own() {
+    // The console runs a pixel program's helper lanes as lanes of EXEC
+    // (`s_wqm`): every lane of a quad, helper or not, is served once. The
+    // host's wave operations leave helper lanes out; a helper lane whose
+    // value no other lane held never met it in a first lane.
+    let ps = pixel(&WATERFALL_OVER_PIXELS);
+    let vs = position_vs();
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut ps.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut vs.dxil.clone()).expect("DXIL validation failed");
+    }
+    // The half of an 8x8 target below its diagonal (pixels with x < y; the
+    // diagonal's own are outside, by the top-left rule): in each 2x2 quad
+    // on the diagonal, pixel (2i, 2i + 1) is drawn and the three others are
+    // helper lanes, the one across x among them.
+    let vertices = [-1.0, -1.0, 0.5, 1.0, 1.0, -1.0, 0.5, 1.0, -1.0, 1.0, 0.5, 1.0];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (8, 8),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
+        for (i, texel) in texels.iter().enumerate() {
+            let (x, y) = (i % 8, i / 8);
+            let want = if x < y { [1.0; 4] } else { [0.0; 4] };
+            assert_eq!(*texel, want, "{label}: pixel ({x}, {y})");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
 }
