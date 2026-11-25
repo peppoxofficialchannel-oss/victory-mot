@@ -46,6 +46,13 @@ pub const CODE: usize = usize::MAX;
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
+/// [`Address::param`] of the console driver's table that user data 0 and 1
+/// (s8 and s9 of a merged stage) point at, which a geometry program reads
+/// its GS-VS ring's place in LDS from. The host has no such ring (the
+/// program's ring accesses are its inputs and outputs,
+/// [`crate::geometry::Rings`]), so what such a load reads is never needed.
+pub const DRIVER: usize = usize::MAX - 2;
+
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
 const RAW: [&str; 5] = [
@@ -301,6 +308,7 @@ pub fn track(
                     let address = t
                         .smem_address(inst, base, *offset, soffset)
                         .or_else(|why| t.by_address(why))
+                        .or_else(|why| t.driver_table(inst, base, why))
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -879,6 +887,30 @@ impl<'a> Tracer<'a> {
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            })
+        } else {
+            Err(why)
+        }
+    }
+
+    /// A geometry program's load from the driver's table ([`DRIVER`]): its
+    /// address the low dword of user data 0 as it arrives, plus constants.
+    fn driver_table(&self, inst: &Inst, base: &Operand, why: &'static str) -> Result<Address, &'static str> {
+        let Operand::Scalar { code, .. } = *base else {
+            return Err(why);
+        };
+        let lo = inst.read(Reg::S(code)).map(|v| self.sum(self.origin(v)));
+        let user_data_0 = Reg::S(self.stage.user_sgpr(0));
+        let from_table = lo.is_some_and(|s| {
+            s.base.is_none()
+                && s.dynamic
+                    .is_some_and(|v| self.inputs[v.0 as usize] == Some(user_data_0))
+        });
+        if self.stage == HwStage::Gs && inst.name().starts_with("s_load_") && from_table {
+            Ok(Address {
+                param: DRIVER,
                 offset: 0,
                 dynamic: None,
             })

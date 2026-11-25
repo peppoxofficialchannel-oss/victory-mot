@@ -553,9 +553,28 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+
+    /// A pipeline of the geometry shader `gs` between a vertex shader that
+    /// feeds its inputs ([`stub_vs`]) and the pixel shader that reads
+    /// nothing ([`stub_ps`]); the geometry stage's user data is root
+    /// parameter 1.
+    pub fn geometry_pipeline(
+        &self,
+        gs: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let (vs, ps) = (stub_vs(gs)?, stub_ps());
+        let root = self.root_signature_for(&[
+            (&vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.pipeline_with_gs(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
 }
 
-/// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
+/// A vertex shader that feeds `ps`'s inputs (zeros) and a position (`ps`
+/// may be a geometry shader).
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
     let mut outputs: Vec<SigElement> = inputs

@@ -72,6 +72,11 @@ struct Tally {
     /// Mesh programs whose outputs pass D3D12's 32 KiB alone, checked as linked for a
     /// pipeline whose pixel program reads none of them (`emit::link_mesh_alone`).
     ms_linked: usize,
+    /// The same for geometry programs.
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
+    gs_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -134,6 +139,10 @@ impl Tally {
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
         self.ms_linked += other.ms_linked;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
+        self.gs_pipelines += other.gs_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -365,6 +374,10 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines \
          ({} of them over 32 KiB alone, checked as linked without the outputs no pixel program reads)",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines, t.ms_linked
+    );
+    println!(
+        "             {} emitted of {} geometry programs; {} validated, {} pipelines",
+        t.gs_emitted, t.gs_programs, t.gs_validated, t.gs_pipelines
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -731,7 +744,7 @@ fn translate_programs(
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || matches!(p.stage, HwStage::Ms | HwStage::Gs) {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -876,6 +889,7 @@ fn check(
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+            HwStage::Gs => h.geometry_pipeline(&shader).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
         match made {
@@ -943,6 +957,12 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_validated,
             &mut t.ms_pipelines,
         ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.gs_pipelines,
+        ],
         _ => [
             &mut t.emit_programs,
             &mut t.emitted,
@@ -1007,15 +1027,12 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
-        // tables are no root parameter.
+        // tables, title memory and the driver's table are no root parameter.
         if let Some(a) = a
-            && a.param != resource::CODE
-            && !matches!(
-                p.layout[a.param].root,
-                RootType::ResourceHeap | RootType::SamplerHeap
-            )
+            && let Some(l) = p.layout.get(a.param)
+            && !matches!(l.root, RootType::ResourceHeap | RootType::SamplerHeap)
         {
-            traced.insert(p.layout[a.param].user_data);
+            traced.insert(l.user_data);
         }
     }
     // Root constants are listed as a CBV, read straight from the SGPRs.

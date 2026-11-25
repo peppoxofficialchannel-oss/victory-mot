@@ -30,6 +30,10 @@
 //! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
 //! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
 //! primitives << 12).
+//!
+//! Geometry programs read their input vertices from LDS and write the
+//! vertices they emit to their slot of the GS-VS ring there
+//! ([`crate::geometry`]).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -190,12 +194,25 @@ pub struct Io {
     /// Compute: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
+    /// A geometry program's ring accesses, its inputs and outputs.
+    pub geometry: Option<crate::geometry::Rings>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    // A geometry program's inputs and outputs are its LDS rings; v2 holds the primitive id.
+    if let (StageIo::Gs(gs), HwStage::Gs) = (&native.io, native.stage) {
+        return Ok(Io {
+            inputs: crate::geometry::operand_input(p, Reg::V(2))
+                .map(|v| (v, Input::PrimitiveId))
+                .into_iter()
+                .collect(),
+            geometry: Some(crate::geometry::raise(p, gs)?),
+            ..Io::default()
+        });
+    }
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
             StageIo::Ps {
