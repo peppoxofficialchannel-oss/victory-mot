@@ -27,8 +27,15 @@
 //!
 //! Off by default (and with `VICTORY_EXPOSURE_SCALE=1`): the title's own
 //! exposure stays. Without the factor the pass records nothing at all.
+//!
+//! `VICTORY_EXPOSURE_LOG=1` reads the 1x1 back as floats, copied just before
+//! the scale and just after it, and logs both once every 60 applications
+//! (and on the first): the dumps cannot show this, since they are 8-bit
+//! PNGs where `x = exp(y)` is 2.72 at exposure 1.0 and 1.36 at 0.5, and both
+//! clip to 255.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -71,6 +78,142 @@ pub(crate) fn writes(bytes: &[u8]) -> bool {
     PROGRAMS
         .iter()
         .any(|program| bytes.windows(program.len()).any(|w| w == *program))
+}
+
+/// Whether `VICTORY_EXPOSURE_LOG` asks for the 1x1 read back and logged.
+pub(crate) fn logging() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXPOSURE_LOG").is_some_and(|v| v != "0"))
+}
+
+/// Whether application `n` (from 1) is one the trace prints: the first, then
+/// one every 60.
+fn every(n: u64) -> bool {
+    n == 1 || n % 60 == 0
+}
+
+/// The 1x1 as it was before the scale and after it, waiting for the list
+/// that copied them to have run.
+struct Logged {
+    /// The list that recorded the copies, by address: only that list's
+    /// completion reads them.
+    list: usize,
+    before: ID3D12Resource,
+    after: ID3D12Resource,
+    factor: f32,
+    n: u64,
+    frame: u64,
+}
+
+/// Read-backs waiting for their list to have run, and how many there are
+/// (the check every completed list makes, without taking the lock).
+static LOGGED: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
+static WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the scale has been recorded (frames, when the exposure is
+/// drawn once a frame).
+static APPLICATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A 512-byte read-back buffer: one 1x1 `f2` row, 256-byte pitched.
+fn readback(device: &ID3D12Device) -> windows::core::Result<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 512,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of a buffer; a read-back buffer stays a copy
+    // destination for its whole life.
+    unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut out,
+        )?
+    };
+    out.ok_or_else(windows::core::Error::empty)
+}
+
+/// The read-back buffer as the destination of a 1x1 `f2` copy.
+fn placed(buffer: &ID3D12Resource) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: FORMAT,
+                    Width: 1,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: 256,
+                },
+            },
+        },
+    }
+}
+
+/// The four floats of a read-back buffer whose list has run.
+fn read(buffer: &ID3D12Resource) -> [f32; 4] {
+    let mut data = std::ptr::null_mut();
+    let mut out = [0f32; 4];
+    // SAFETY: a read-back buffer of ours, written by a list that has run;
+    // only the first 16 bytes are read, and the buffer holds 512.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
+            std::ptr::copy_nonoverlapping(data.cast::<f32>(), out.as_mut_ptr(), 4);
+            buffer.Unmap(0, None);
+        }
+    }
+    out
+}
+
+/// After `list` has run (`crate::host::read_backs`): what its trace copied
+/// before and after the scale, logged. Lists with no trace leave at once.
+pub(crate) fn log_read_backs(list: &HostList) {
+    if WAITING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let me = std::ptr::from_ref(list) as usize;
+    let mut waiting = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    waiting.retain(|logged| {
+        if logged.list != me {
+            return true;
+        }
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+        let before = read(&logged.before);
+        let after = read(&logged.after);
+        tracing::info!(
+            factor = logged.factor,
+            n = logged.n,
+            frame = logged.frame,
+            "exposure x/y before -> after (VICTORY_EXPOSURE_LOG): {:.5}/{:.5} -> {:.5}/{:.5}",
+            before[0],
+            before[1],
+            after[0],
+            after[1]
+        );
+        false
+    });
 }
 
 const SOURCE: &str = r#"
@@ -294,6 +437,19 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
     });
     let l = &list.list;
     list.keep(&pass.copy);
+    // `VICTORY_EXPOSURE_LOG`: the 1x1 copied before the scale and after it,
+    // read once this list has run (`log_read_backs`).
+    let mut trace: Option<(u64, ID3D12Resource, ID3D12Resource)> = None;
+    if logging() {
+        let n = APPLICATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        if every(n)
+            && let (Ok(before), Ok(after)) = (readback(&host.device), readback(&host.device))
+        {
+            list.keep(&before);
+            list.keep(&after);
+            trace = Some((n, before, after));
+        }
+    }
     // The target the draw just wrote, put where the copy reads it.
     crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
     // SAFETY: an open list and live resources; our image is common at the
@@ -313,12 +469,30 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
             &subresource(exposure),
             None,
         );
-        barrier(
-            l,
-            &pass.copy,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        );
+        match &trace {
+            // The value the title wrote, before the scale.
+            Some((_, before, _)) => {
+                barrier(
+                    l,
+                    &pass.copy,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                );
+                l.CopyTextureRegion(&placed(before), 0, 0, 0, &subresource(&pass.copy), None);
+                barrier(
+                    l,
+                    &pass.copy,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+            }
+            None => barrier(
+                l,
+                &pass.copy,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        }
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
@@ -333,6 +507,10 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         );
+        // The value as the pass left it, after the scale.
+        if let Some((_, _, after)) = &trace {
+            l.CopyTextureRegion(&placed(after), 0, 0, 0, &subresource(&pass.copy), None);
+        }
     }
     crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
     // SAFETY: as above; the scaled image goes back into the target.
@@ -355,6 +533,20 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COMMON,
     );
+    if let Some((n, before, after)) = trace {
+        LOGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Logged {
+                list: std::ptr::from_ref(list) as usize,
+                before,
+                after,
+                factor,
+                n,
+                frame: crate::frame::current(),
+            });
+        WAITING.fetch_add(1, Ordering::Relaxed);
+    }
     true
 }
 
@@ -378,6 +570,18 @@ mod tests {
         assert_eq!(super::scale_of("4.0"), Some(4.0));
         assert_eq!(super::scale_of(" 0.5 "), Some(0.5));
         assert_eq!(super::scale_of("1.0"), Some(1.0));
+    }
+
+    /// The trace prints the first application, then one every 60.
+    #[test]
+    fn the_trace_prints_one_in_sixty() {
+        assert!(super::every(1));
+        assert!(!super::every(2));
+        assert!(!super::every(59));
+        assert!(super::every(60));
+        assert!(!super::every(61));
+        assert!(super::every(120));
+        assert!(super::every(121 + 59));
     }
 
     /// The programs are found by name, anywhere in the container.

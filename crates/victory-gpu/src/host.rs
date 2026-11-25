@@ -3704,6 +3704,9 @@ fn read_backs(list: &HostList) {
             }
         }
     }
+    // The exposure lever's own trace (`VICTORY_EXPOSURE_LOG`), if this list
+    // recorded one: the same "the list has run" moment.
+    crate::exposure::log_read_backs(list);
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
