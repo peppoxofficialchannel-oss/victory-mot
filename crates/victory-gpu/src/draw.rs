@@ -3082,6 +3082,36 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        if ran && self.exposure(list) {
+            // The pass bound its own heap, root signature and pipeline:
+            // the next draw or dispatch binds the title's again.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a draw: the exposure it wrote is scaled by
+    /// `VICTORY_EXPOSURE_SCALE` ([`crate::exposure`]), if its program is one
+    /// of those that write the exposure. Whether anything was recorded.
+    fn exposure(&self, list: &HostList) -> bool {
+        if crate::exposure::scale().is_none() {
+            return false;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        if !p.stages.iter().any(|s| s.shader.writes_exposure) {
+            return false;
+        }
+        // The exposure programs draw a three-vertex triangle over a 1x1
+        // viewport into the only 1x1 f2 target there is; a draw under such a
+        // program into anything else is not the exposure, and is left alone.
+        let mut targets = self.targets.iter().filter(|&&t| t != 0);
+        let (Some(&target), None) = (targets.next(), targets.next()) else {
+            return false;
+        };
+        crate::exposure::after_draw(list, target as This)
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the

@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the exposure that the tone pass reads ([`crate::exposure`]).
+    #[cfg(windows)]
+    pub(crate) writes_exposure: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -144,6 +147,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             resolves_light: crate::ambient::resolves(bytes),
+            #[cfg(windows)]
+            writes_exposure: crate::exposure::writes(bytes),
             #[cfg(windows)]
             translated: OnceLock::new(),
             #[cfg(windows)]
@@ -239,6 +244,7 @@ impl Shader {
                     hash: self.hash.clone(),
                     container: self.container.clone(),
                     resolves_light: self.resolves_light,
+                    writes_exposure: self.writes_exposure,
                     translated: OnceLock::new(),
                     #[cfg(feature = "diagnostics")]
                     loop_slot: OnceLock::new(),

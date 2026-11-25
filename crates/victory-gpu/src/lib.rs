@@ -40,6 +40,8 @@ mod host;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod exposure;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
