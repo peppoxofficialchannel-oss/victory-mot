@@ -226,6 +226,38 @@ fn position_vs() -> HostShader {
     host_shader(HwStage::Vs, vs.finish())
 }
 
+#[test]
+fn a_vertex_program_with_loop_notes_declares_its_uav() {
+    // A vertex or mesh program with loop notes binds the notes as a root UAV:
+    // it must declare UAVs at a stage other than pixel and compute, or the
+    // validator refuses it ("Flags must match usage", 62 of the 801 vertex
+    // and mesh programs of a game run translated with notes).
+    let mut vs = Shader::new(false);
+    vs.inputs = vec![element("POSITION", 0, 0, 15)];
+    vs.outputs = vec![element("SV_Position", 3, 4, 15)];
+    let b = vs.entry;
+    let h = vs.root_uav_handle(SLOT_LOOPS);
+    let (i32t, void) = (vs.t.i32, vs.t.void);
+    let iu = vs.m.undef(i32t);
+    let (at, first, mask, align) = (vs.m.i32(0), vs.m.i32(1), vs.m.i8(1), vs.m.i32(4));
+    let args = [h, at, iu, first, iu, iu, iu, mask, align];
+    vs.op(b, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+    for col in 0..4 {
+        let args = [vs.m.i32(0), vs.m.i32(0), vs.m.i8(col), vs.m.undef(vs.t.i32)];
+        let v = vs.op(b, "loadInput.f32", Attr::ReadNone, vs.t.f32, 4, &args);
+        let args = [vs.m.i32(0), vs.m.i32(0), vs.m.i8(col), v];
+        vs.op(b, "storeOutput.f32", Attr::NoUnwind, vs.t.void, 5, &args);
+    }
+    vs.m.terminate(b, Term::Ret);
+    let mut dxil = vs.finish();
+    let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+    else {
+        eprintln!("no dxil.dll; skipped");
+        return;
+    };
+    v.validate(&mut dxil).expect("DXIL validation failed");
+}
+
 /// A wave32 pixel program that reads the pixel's position (x in v0, y in
 /// v1) and exports target 0.
 fn pixel(words: &[u32]) -> HostShader {
