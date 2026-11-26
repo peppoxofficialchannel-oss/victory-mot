@@ -2521,22 +2521,31 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
+    //
+    // Both branches below ask for the copy of the same buffer, with the same
+    // key (`buffer_extent`): it is looked up once, and only when a branch
+    // could use it (the copy is made on first use, `shadow::find`).
+    let extent = buffer_extent(view);
+    let fields = buffer_fields(view);
+    let whole = extent
+        .filter(|&(base, width)| {
+            fields.is_some() || (view_extent() && address >= base && address - base < width.max(1))
+        })
+        .and_then(|(base, width)| crate::shadow::find(base, width));
+    if let (Some((base, _)), Some((first, count, element, stride, unknown)), Some(whole)) =
+        (extent, fields, whole.as_ref())
         && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
     }
     if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+        && let (Some((base, width)), Some(shadow)) = (extent, whole.as_ref())
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
     {
-        return Some((shadow, address, len));
+        return Some((shadow.clone(), address, len));
     }
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
 }
