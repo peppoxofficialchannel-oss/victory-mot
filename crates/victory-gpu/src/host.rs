@@ -2059,6 +2059,16 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// An upload buffer a list's GPU commands read, held until the list is
+/// reset: the buffer, where it is mapped, its bytes (the size it was made
+/// with), and whether it is a pooled one ([`spare_upload`]).
+struct Held {
+    buffer: ID3D12Resource,
+    data: usize,
+    bytes: u64,
+    pooled: bool,
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -2066,9 +2076,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
-    upload_bytes: u64,
+    uploads: Vec<Held>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2097,21 +2105,133 @@ struct Deferred {
 }
 
 impl Deferred {
-    /// Holds `buffer` (`size` bytes of upload memory) until the list is
-    /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
-        ALIVE[6].fetch_add(1, Ordering::Relaxed);
-        ALIVE[7].fetch_add(size, Ordering::Relaxed);
-        self.upload_bytes += size;
-        self.uploads.push(buffer);
+    /// Holds `buffer` (`bytes` of upload memory, mapped at `data`) until the
+    /// list is reset. A pooled one ([`spare_upload`]) is not counted in
+    /// [`ALIVE`]`[6..8]`, which is what lists keep of their own: it goes
+    /// back to the pool instead of being freed.
+    fn hold_upload(&mut self, buffer: ID3D12Resource, data: usize, bytes: u64, pooled: bool) {
+        if !pooled {
+            ALIVE[6].fetch_add(1, Ordering::Relaxed);
+            ALIVE[7].fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.uploads.push(Held { buffer, data, bytes, pooled });
     }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
-        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        let mut freed = Vec::new();
+        for held in std::mem::take(&mut self.uploads) {
+            if held.pooled {
+                // Kept for the next copy (`VICTORY_REUSE_UPLOAD`), or freed
+                // past the pool's cap.
+                if let Some(buffer) = give_upload(held) {
+                    freed.push(buffer);
+                }
+                continue;
+            }
+            ALIVE[6].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[7].fetch_sub(held.bytes, Ordering::Relaxed);
+            freed.push(held.buffer);
+        }
+        // Freed outside the lock, the driver's own time (as the chunks are).
+        drop(freed);
     }
+}
+
+/// Whether a list's per-copy upload buffers are kept and used again
+/// (`VICTORY_REUSE_UPLOAD=1`; off by default).
+///
+/// Every copy of title memory into upload memory (`HostList::upload`: the
+/// buffer behind a texture's bytes, `crate::list`'s footprint copies) made
+/// a buffer of its own, mapped it, wrote the copy into it and let it go
+/// once the list had run: about 2,700 buffers and 109 MB a frame in
+/// gameplay, each destination page touched for the first time (26,404 page
+/// faults a frame, ~1.2 µs each, where the copies' own 40 KB take 0.9 µs).
+/// With the switch a buffer that size is kept and written again by the
+/// next copy: same bytes into the same kind of destination, only the
+/// memory is not given back between frames.
+fn reuse_upload() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REUSE_UPLOAD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the upload buffers copies write into are kept and used again between frames (VICTORY_REUSE_UPLOAD=1)"
+            );
+        }
+        on
+    })
+}
+
+/// An upload buffer nothing holds: the buffer, where it is mapped, its bytes.
+struct SpareUpload(ID3D12Resource, usize, u64);
+
+// SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
+// written by nobody while it is spare.
+unsafe impl Send for SpareUpload {}
+
+/// Spare upload buffers by size (a multiple of [`UPLOAD_GRAIN`]), and their
+/// bytes in all.
+static SPARE_UPLOAD: Mutex<(std::collections::BTreeMap<u64, Vec<SpareUpload>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+
+/// The most bytes kept spare, and the largest buffer kept.
+const SPARE_UPLOAD_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// Sizes are rounded up to this, so that a copy of a like size finds a
+/// buffer of its own rather than the largest one kept.
+const UPLOAD_GRAIN: u64 = 4 << 10;
+/// Spare upload buffers taken and made since the start.
+static SPARE_UPLOAD_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The size a buffer for `size` bytes is made and kept at.
+fn upload_bucket(size: u64) -> u64 {
+    size.max(UPLOAD_GRAIN).next_multiple_of(UPLOAD_GRAIN)
+}
+
+/// A mapped upload buffer of `size` bytes for a copy: one kept of that size
+/// or of the smallest size above it, or a new one; with the size it is to be
+/// given back at (0: not pooled, freed with the list as before).
+fn spare_upload(host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    // (A copy bigger than the largest buffer kept is not pooled: it is made
+    // and freed as before, and its size never reaches the rounding below.)
+    if !reuse_upload() || size > SPARE_UPLOAD_MOST.1 {
+        return host.upload_buffer(size).map(|(buffer, data)| (buffer, data, 0));
+    }
+    let bucket = upload_bucket(size);
+    let spare = {
+        let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+        let at = all.0.range(bucket..).next().map(|(&at, _)| at);
+        let taken = at.and_then(|at| {
+            let taken = all.0.get_mut(&at)?.pop()?;
+            if all.0.get(&at).is_some_and(|kept| kept.is_empty()) {
+                all.0.remove(&at);
+            }
+            all.1 -= at;
+            Some(taken)
+        });
+        taken
+    };
+    if let Some(SpareUpload(buffer, data, bytes)) = spare {
+        SPARE_UPLOAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Some((buffer, data as *mut u8, bytes));
+    }
+    SPARE_UPLOAD_STATS[1].fetch_add(1, Ordering::Relaxed);
+    host.upload_buffer(bucket).map(|(buffer, data)| (buffer, data, bucket))
+}
+
+/// Keeps a pooled buffer for the next copy, or gives it back to be freed
+/// (past [`SPARE_UPLOAD_MOST`]).
+fn give_upload(held: Held) -> Option<ID3D12Resource> {
+    let Held { buffer, data, bytes, .. } = held;
+    let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+    if all.1 + bytes > SPARE_UPLOAD_MOST.0 {
+        return Some(buffer);
+    }
+    all.1 += bytes;
+    all.0.entry(bytes).or_default().push(SpareUpload(buffer, data, bytes));
+    None
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
@@ -6877,13 +6997,14 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset: one kept from the last copy of that size with
+    /// `VICTORY_REUSE_UPLOAD`, else a new one.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
+        let (buffer, data, pooled) = spare_upload(host, size)?;
         name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        // (A pooled one is made at its bucket's size, never below `size`.)
+        let bytes = if pooled == 0 { size } else { pooled };
+        self.deferred().hold_upload(buffer.clone(), data as usize, bytes, pooled != 0);
         Some((buffer, data))
     }
 
@@ -6898,7 +7019,7 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
+            self.deferred().hold_upload(buffer, data as usize, len, false);
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
@@ -8834,6 +8955,31 @@ mod trail {
         assert!(text.contains("pipeline library: no call running"));
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));
         assert!(!text.contains("thing 4 done"), "the oldest entries are dropped");
+    }
+}
+
+#[cfg(test)]
+mod upload_pool {
+    use super::{UPLOAD_GRAIN, upload_bucket};
+
+    /// A buffer for `size` bytes is kept at a multiple of the grain, at
+    /// least the grain, and never smaller than the bytes asked for; a copy
+    /// of the same size asks for the same buffer, and one a page larger
+    /// asks for the next one.
+    #[test]
+    fn sizes_are_kept_by_grain() {
+        assert_eq!(upload_bucket(0), UPLOAD_GRAIN);
+        assert_eq!(upload_bucket(1), UPLOAD_GRAIN);
+        assert_eq!(upload_bucket(UPLOAD_GRAIN), UPLOAD_GRAIN);
+        assert_eq!(upload_bucket(UPLOAD_GRAIN + 1), 2 * UPLOAD_GRAIN);
+        // The copies in gameplay: 40 KB, kept at 40 KB and 44 KB.
+        assert_eq!(upload_bucket(40 << 10), 40 << 10);
+        assert_eq!(upload_bucket((40 << 10) + 1), 44 << 10);
+        // Never below what was asked.
+        for size in [1, 4095, 4096, 4097, 99_999, 3 << 20, (4 << 20) - 1] {
+            let bucket = upload_bucket(size);
+            assert!(bucket >= size && bucket % UPLOAD_GRAIN == 0);
+        }
     }
 }
 
