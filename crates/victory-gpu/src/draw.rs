@@ -36,6 +36,93 @@ enum Root {
     View(u64),
 }
 
+/// A root argument as a bind set it on the host list: enough to set it
+/// again without building the tables it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Arg {
+    /// `Set*Root32BitConstants`, the values at offset 0.
+    Constants(Vec<u32>),
+    /// `Set*RootConstantBufferView`.
+    Cbv(u64),
+    /// `Set*RootShaderResourceView`.
+    Srv(u64),
+    /// `Set*RootUnorderedAccessView`.
+    Uav(u64),
+    /// `Set*RootDescriptorTable`, the table's first descriptor.
+    Table(u64),
+}
+
+/// The root parameters the argument clamp writes over: its own root
+/// signature's 32-bit constants of parameter 0, the SRVs of 1 and 2 and
+/// the UAVs of 3 and 4 (`crate::indirect`, `record_clamp_as`). A root
+/// signature set before the clamp leaves the parameters past these alone.
+const CLAMP_PARAMETERS: std::ops::RangeInclusive<u32> = 0..=4;
+
+/// What one `(list, compute)` was last given by `bind`: the state's stamp,
+/// the pipeline, root signature and heaps it had, and every root argument
+/// it set, in the order it set them.
+#[derive(Default)]
+struct Bound {
+    stamp: u64,
+    pso: usize,
+    root: usize,
+    heaps: [usize; 2],
+    args: Vec<(u32, Arg)>,
+}
+
+/// What a bind has to do once its tables and the host copies of the title's
+/// memory are up to date.
+#[derive(Debug)]
+struct Work {
+    /// Whether the tables and the host copies of title memory are brought up
+    /// to date. Always true: a descriptor the title rewrites in place in its
+    /// heap changes no root argument, so only `tables` (and its mirror) can
+    /// see it, and the bytes a title writes into a buffer leave its GPU
+    /// address alone, so only `memory_ready`/`root_view` see them. The
+    /// decision below only ever says which root arguments are already there.
+    mirror: bool,
+    /// The root parameters to set again, in the order the bind computed them.
+    set: Vec<u32>,
+}
+
+/// The decision. `prev` is what the list was last given; `now` are the root
+/// arguments this bind computed; `stamp`, `pso`, `root` and `heaps` are the
+/// state's and the list's now; `stale` are the root parameters written over
+/// since that bind (a clamp's, a split dispatch's). With the same state, the
+/// parameters whose argument changed (a table given another dynamic slot,
+/// say) are set again; with any change, all of them.
+fn replay(
+    prev: Option<&Bound>,
+    now: &[(u32, Arg)],
+    stamp: u64,
+    pso: usize,
+    root: usize,
+    heaps: [usize; 2],
+    stale: &[u32],
+) -> Work {
+    let set = match prev {
+        Some(prev)
+            if prev.stamp == stamp
+                && prev.pso == pso
+                && prev.root == root
+                && prev.heaps == heaps =>
+        {
+            now.iter()
+                .filter(|(param, arg)| {
+                    stale.contains(param)
+                        || !prev
+                            .args
+                            .iter()
+                            .any(|(was, old)| was == param && old == arg)
+                })
+                .map(|(param, _)| *param)
+                .collect()
+        }
+        _ => now.iter().map(|(param, _)| *param).collect(),
+    };
+    Work { mirror: true, set }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -271,6 +358,16 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// A number bumped by everything of the title's that `bind` reads: a
+    /// bind that finds it unchanged (and the pipeline, root signature and
+    /// heaps too) need not set its arguments again.
+    stamp: u64,
+    /// What this list was last given by `bind`, graphics and compute.
+    bound: [Option<Bound>; 2],
+    /// Root parameters the list no longer holds as the last bind left them:
+    /// those a clamp wrote over, and a split dispatch's group base. Graphics
+    /// and compute.
+    stale: [Vec<u32>; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -322,6 +419,18 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+        // The dynamic slots the binds' arguments named are gone: so is what
+        // the list was last given.
+        self.bound = [None, None];
+        self.stale.iter_mut().for_each(Vec::clear);
+    }
+}
+
+/// The state changed in something `bind` reads: the next bind must set its
+/// arguments again.
+impl State {
+    fn changed(&mut self) {
+        self.stamp = self.stamp.wrapping_add(1);
     }
 }
 
@@ -666,6 +775,41 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Sets one root argument on the list.
+fn set_root(l: &ID3D12GraphicsCommandList, compute: bool, param: u32, arg: &Arg) {
+    // SAFETY: an open list; the argument names an object the list holds.
+    unsafe {
+        match (compute, arg) {
+            (true, Arg::Constants(values)) => l.SetComputeRoot32BitConstants(
+                param,
+                values.len() as u32,
+                values.as_ptr().cast(),
+                0,
+            ),
+            (false, Arg::Constants(values)) => l.SetGraphicsRoot32BitConstants(
+                param,
+                values.len() as u32,
+                values.as_ptr().cast(),
+                0,
+            ),
+            (true, Arg::Cbv(gpu)) => l.SetComputeRootConstantBufferView(param, *gpu),
+            (false, Arg::Cbv(gpu)) => l.SetGraphicsRootConstantBufferView(param, *gpu),
+            (true, Arg::Srv(gpu)) => l.SetComputeRootShaderResourceView(param, *gpu),
+            (false, Arg::Srv(gpu)) => l.SetGraphicsRootShaderResourceView(param, *gpu),
+            (true, Arg::Uav(gpu)) => l.SetComputeRootUnorderedAccessView(param, *gpu),
+            (false, Arg::Uav(gpu)) => l.SetGraphicsRootUnorderedAccessView(param, *gpu),
+            (true, Arg::Table(ptr)) => l.SetComputeRootDescriptorTable(
+                param,
+                D3D12_GPU_DESCRIPTOR_HANDLE { ptr: *ptr },
+            ),
+            (false, Arg::Table(ptr)) => l.SetGraphicsRootDescriptorTable(
+                param,
+                D3D12_GPU_DESCRIPTOR_HANDLE { ptr: *ptr },
+            ),
+        }
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -694,6 +838,7 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+        self.changed();
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -704,6 +849,7 @@ impl State {
                 self.heaps[usize::from(samplers)] = h as usize;
             }
         }
+        self.changed();
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
@@ -716,10 +862,12 @@ impl State {
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
         set(self.roots(compute), slot, Root::Table(handle));
+        self.changed();
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
         set(self.roots(compute), slot, Root::View(address));
+        self.changed();
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
@@ -735,6 +883,7 @@ impl State {
             }
             c[offset as usize..end].copy_from_slice(values);
         }
+        self.changed();
     }
 
     pub(crate) fn set_vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
@@ -757,6 +906,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.changed();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -876,6 +1026,9 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        // A new host list has nothing bound.
+        self.bound = [None, None];
+        self.stale.iter_mut().for_each(Vec::clear);
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1132,6 +1285,31 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let index = usize::from(compute);
+        // What the list was last given: taken, so a bind that fails (or a
+        // state that changed) leaves none and the next one sets it all.
+        let prev = self.bound[index].take();
+        // Sub-profile of the bind (`VICTORY_CALL_PROFILE`, diagnostics): the
+        // fixed prefix, the tables, the directory of title memory, and the
+        // root arguments, in the call profile's own table.
+        #[cfg(feature = "diagnostics")]
+        let prof = crate::copystat::call_profile_on();
+        #[cfg(feature = "diagnostics")]
+        let mut mark = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        macro_rules! phase {
+            ($name:literal) => {
+                if prof {
+                    let now = std::time::Instant::now();
+                    crate::copystat::call_profile($name, now.duration_since(mark).as_nanos() as u64);
+                    mark = now;
+                }
+            };
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        macro_rules! phase {
+            ($name:literal) => {};
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1162,7 +1340,7 @@ impl State {
         };
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+        if self.host_roots[index] != root {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1171,7 +1349,7 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
-            self.host_roots[usize::from(compute)] = root;
+            self.host_roots[index] = root;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1184,10 +1362,20 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        phase!("bind/roots");
+        // The tables and the directory of title memory are made ready by
+        // every bind, whatever it ends up setting: a descriptor the title
+        // rewrites in place changes no root argument, so only `tables` (its
+        // mirror) can see it. The decision below only spares the root
+        // arguments the list already holds.
+        // Every root argument this bind computed, in the order it made them.
+        let mut args: Vec<(u32, Arg)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            phase!("bind/descriptors");
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            phase!("bind/tables");
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1208,6 +1396,7 @@ impl State {
             } else {
                 None
             };
+            phase!("bind/memory");
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -1224,14 +1413,8 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
+                let arg = Arg::Constants(values);
+                args.push((param, arg));
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -1240,13 +1423,8 @@ impl State {
                         if let Some(m) = &memory {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            let arg = Arg::Srv(m.directory);
+                            args.push((param, arg));
                         }
                         continue;
                     }
@@ -1268,14 +1446,8 @@ impl State {
                                 if list.first_use(ONCE) {
                                     list.keep(buffer);
                                 }
-                                // SAFETY: an open list; the list holds the table.
-                                unsafe {
-                                    if compute {
-                                        l.SetComputeRootShaderResourceView(param, gpu);
-                                    } else {
-                                        l.SetGraphicsRootShaderResourceView(param, gpu);
-                                    }
-                                }
+                                let arg = Arg::Srv(gpu);
+                                args.push((param, arg));
                             }
                             None => once!("a shader takes view addresses from a view heap that is not set"),
                         }
@@ -1285,15 +1457,10 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            Some(gpu) => {
+                                let arg = Arg::Srv(gpu);
+                                args.push((param, arg));
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1303,7 +1470,9 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                        if tabled
+                            && !self.root_srv_table(list, None, param, false, &mut args)
+                        {
                             return false;
                         }
                         continue;
@@ -1315,7 +1484,7 @@ impl State {
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                        if !self.root_srv_table(list, Some(address), param, biased, &mut args) {
                             return false;
                         }
                         continue;
@@ -1332,15 +1501,8 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    let arg = if srv { Arg::Srv(gpu) } else { Arg::Cbv(gpu) };
+                    args.push((param, arg));
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -1352,15 +1514,8 @@ impl State {
                         once!("loop notes without their buffer: the draw is dropped");
                         return false;
                     };
-                    // SAFETY: an open list; the buffer lives as long as the
-                    // process.
-                    unsafe {
-                        if compute {
-                            l.SetComputeRootUnorderedAccessView(param, gpu);
-                        } else {
-                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
-                        }
-                    }
+                    let arg = Arg::Uav(gpu);
+                    args.push((param, arg));
                     continue;
                 }
                 if slot == victory_shader::emit::SLOT_FAULTS {
@@ -1368,13 +1523,8 @@ impl State {
                     if let Some(m) = &memory {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        let arg = Arg::Uav(m.faults);
+                        args.push((param, arg));
                     }
                     continue;
                 }
@@ -1385,14 +1535,44 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, param, writes, &mut args) {
                     return false;
                 }
+            }
+            phase!("bind/descriptors");
+        }
+        // What is left to set: with the same state, only the arguments whose
+        // value changed (a table given another dynamic slot, say) and the
+        // ones a clamp or a split dispatch wrote over; with any change, all.
+        let work = replay(
+            prev.as_ref(),
+            &args,
+            self.stamp,
+            self.host_pipeline,
+            self.host_roots[index],
+            self.host_heaps,
+            &self.stale[index],
+        );
+        debug_assert!(
+            work.mirror,
+            "a bind always brings its tables and title memory up to date"
+        );
+        for (param, arg) in &args {
+            if work.set.contains(param) {
+                set_root(l, compute, *param, arg);
             }
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        self.stale[index].clear();
+        self.bound[index] = Some(Bound {
+            stamp: self.stamp,
+            pso: self.host_pipeline,
+            root: self.host_roots[index],
+            heaps: self.host_heaps,
+            args,
+        });
         true
     }
 
@@ -1412,8 +1592,8 @@ impl State {
         list: &HostList,
         address: Option<u64>,
         param: u32,
-        compute: bool,
         writes: bool,
+        args: &mut Vec<(u32, Arg)>,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1450,14 +1630,8 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
-            // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            let arg = Arg::Uav(gpu);
+            args.push((param, arg));
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1501,14 +1675,8 @@ impl State {
             ready(*a, s);
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        let arg = Arg::Table(handle.ptr);
+        args.push((param, arg));
         true
     }
 
@@ -1523,8 +1691,8 @@ impl State {
         list: &HostList,
         address: Option<u64>,
         param: u32,
-        compute: bool,
         biased: bool,
+        args: &mut Vec<(u32, Arg)>,
     ) -> bool {
         let heap = match self.heaps[0] {
             0 => None,
@@ -1584,14 +1752,8 @@ impl State {
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        let arg = Arg::Table(handle.ptr);
+        args.push((param, arg));
         true
     }
 
@@ -2542,6 +2704,11 @@ impl State {
                     }
                     first += n;
                 }
+                // The last part left its first group in the user data, not
+                // the bind's values: the next bind sets that parameter again.
+                if !self.stale[1].contains(&param) {
+                    self.stale[1].push(param);
+                }
             }
             // SAFETY: an open list with everything set.
             None => unsafe { list.list.Dispatch(x, y, z) },
@@ -2646,9 +2813,15 @@ impl State {
             dropped(self.pipeline);
             return;
         }
-        self.limits = cut.then_some(threads);
-        self.dispatch(list, groups[0], groups[1], groups[2]);
-        self.limits = None;
+        if cut {
+            self.limits = Some(threads);
+            self.changed();
+            self.dispatch(list, groups[0], groups[1], groups[2]);
+            self.limits = None;
+            self.changed();
+        } else {
+            self.dispatch(list, groups[0], groups[1], groups[2]);
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3534,6 +3707,36 @@ impl State {
 }
 
 impl State {
+    /// The argument clamp ran on `list` (`crate::indirect`): it bound its own
+    /// compute root signature and pipeline over the title's, and wrote root
+    /// parameters 0 to 4 ([`CLAMP_PARAMETERS`]) of it. Where the state's own
+    /// pipeline and root signature were the ones bound, sets them again, so
+    /// the next bind sets only the arguments the clamp wrote; where not, the
+    /// caches are left to force it to set everything.
+    fn after_clamp(&mut self, list: &HostList, p: &HostPipeline) {
+        if self.host_pipeline == p.pso.as_raw() as usize {
+            // SAFETY: an open list; the pipeline is live and the list keeps it.
+            unsafe { list.list.SetPipelineState(&p.pso) };
+        } else {
+            self.host_pipeline = 0;
+        }
+        if p.compute && self.host_roots[1] == p.root.as_raw() as usize {
+            // SAFETY: an open list; a live root signature.
+            unsafe { list.list.SetComputeRootSignature(&p.root) };
+        } else {
+            // The clamp's root signature is a compute one: whatever the
+            // state had bound there is not on the list any more.
+            self.host_roots[1] = 0;
+        }
+        // The clamp wrote the first five root arguments of whatever compute
+        // signature is set next: the rest are as this state left them.
+        for param in CLAMP_PARAMETERS {
+            if !self.stale[1].contains(&param) {
+                self.stale[1].push(param);
+            }
+        }
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -3684,8 +3887,7 @@ impl State {
                         at,
                     )
                 {
-                    self.host_pipeline = 0;
-                    self.host_roots[1] = 0;
+                    self.after_clamp(list, p);
                 }
                 (scratch, at)
             }
@@ -3732,8 +3934,7 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
+                self.after_clamp(list, p);
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -4304,6 +4505,85 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_bound() -> Bound {
+        Bound {
+            stamp: 7,
+            pso: 0x1000,
+            root: 0x2000,
+            heaps: [0x3000, 0x4000],
+            args: vec![
+                (0, Arg::Constants(vec![1, 2, 3, 4, 5, 6])),
+                (1, Arg::Srv(0x5000)),
+                (2, Arg::Srv(0x6000)),
+                (3, Arg::Uav(0x7000)),
+                (4, Arg::Uav(0x8000)),
+                (5, Arg::Cbv(0x9000)),
+            ],
+        }
+    }
+
+    /// The tables and the host copies of title memory are brought up to date
+    /// by every bind (`mirror`), whatever it leaves unset; with the same
+    /// state only the arguments whose value changed are set, plus the ones a
+    /// clamp wrote over; with any change, all of them.
+    #[test]
+    fn a_bind_always_mirrors_and_sets_only_what_changed() {
+        let bound = a_bound();
+        let same = a_bound().args;
+        let state = |stale: &[u32]| {
+            replay(
+                Some(&bound),
+                &same,
+                7,
+                0x1000,
+                0x2000,
+                [0x3000, 0x4000],
+                stale,
+            )
+        };
+        // Two binds with the same state: the mirror still runs, nothing is
+        // set.
+        let w = state(&[]);
+        assert!(w.mirror, "the tables and memory are brought up to date");
+        assert!(w.set.is_empty(), "{w:?}");
+
+        // The same state, but the record of the table behind the user data
+        // was rewritten in place: `tables` gives it another dynamic slot, so
+        // the constant holding its offset changed and must be set.
+        let mut rewritten = a_bound().args;
+        rewritten[0] = (0, Arg::Constants(vec![9, 9, 9, 9, 9, 9]));
+        let w = replay(
+            Some(&bound),
+            &rewritten,
+            7,
+            0x1000,
+            0x2000,
+            [0x3000, 0x4000],
+            &[],
+        );
+        assert!(w.mirror);
+        assert_eq!(w.set, vec![0], "the changed argument is set again");
+
+        // After the clamp: the five parameters it wrote, mirror running.
+        let stale: Vec<u32> = CLAMP_PARAMETERS.collect();
+        let w = state(&stale);
+        assert!(w.mirror);
+        assert_eq!(w.set, vec![0, 1, 2, 3, 4]);
+
+        // A state that changed, another pipeline, another root signature or
+        // other heaps: everything.
+        for w in [
+            replay(Some(&bound), &same, 8, 0x1000, 0x2000, [0x3000, 0x4000], &[]),
+            replay(Some(&bound), &same, 7, 0x1001, 0x2000, [0x3000, 0x4000], &[]),
+            replay(Some(&bound), &same, 7, 0x1000, 0x2001, [0x3000, 0x4000], &[]),
+            replay(Some(&bound), &same, 7, 0x1000, 0x2000, [0x3000, 0x4001], &[]),
+            replay(None, &same, 7, 0x1000, 0x2000, [0x3000, 0x4000], &[]),
+        ] {
+            assert!(w.mirror);
+            assert_eq!(w.set, vec![0, 1, 2, 3, 4, 5], "{w:?}");
+        }
+    }
 
     /// `VICTORY_TEXTURE_SLOW_LOOK` reads as a positive whole number of
     /// frames, and off for anything else (absent, empty, 0, negative, not a

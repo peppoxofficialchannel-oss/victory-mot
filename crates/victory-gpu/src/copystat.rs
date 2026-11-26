@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -1061,28 +1061,40 @@ type Bucket = Vec<(&'static str, u64, u64, u64)>;
 
 /// A thread's bucket. Each recording thread adds to its own without a lock
 /// (38,000 calls a frame would otherwise contend and distort the very
-/// ranking the profile is for); it is handed to the line when the line
-/// asks ([`WANTED`]) and when the thread ends.
-struct Calls(Bucket);
+/// ranking the profile is for); it is handed to the line at the thread's next
+/// recorded call after the line asks ([`WANTED`]) and when the thread ends.
+/// `delivered` is the asking it last handed over for.
+struct Calls {
+    bucket: Bucket,
+    delivered: u64,
+}
 
 impl Drop for Calls {
     fn drop(&mut self) {
-        push_calls(std::mem::take(&mut self.0));
+        push_calls(std::mem::take(&mut self.bucket));
     }
 }
 
 thread_local! {
     /// This thread's calls since it last handed them to the line.
-    static CALLS: RefCell<Calls> = const { RefCell::new(Calls(Vec::new())) };
+    static CALLS: RefCell<Calls> = const {
+        RefCell::new(Calls { bucket: Vec::new(), delivered: 0 })
+    };
 }
 
 /// Buckets handed over by the threads: merged into the line's table.
 static PUSHED: Mutex<Vec<Bucket>> = Mutex::new(Vec::new());
 
-/// Set while a line is being made: each thread hands its bucket over at
-/// its next recorded call, so a thread recording for the whole run is seen
-/// without a lock in the hot path.
-static WANTED: AtomicBool = AtomicBool::new(false);
+/// How many lines have been made: a thread hands its bucket over at its next
+/// recorded call after this changes.
+///
+/// It used to be a flag set **and cleared inside the same line**, microseconds
+/// apart: a recording thread only handed its bucket over if it happened to
+/// record inside that window, which it never did, so the line read "none
+/// recorded" for whole runs with `VICTORY_CALL_PROFILE=1` set (26/11, runs
+/// `base2` and `fpsX`, with `gpu_diagnostics=true`). A generation stays changed
+/// until each thread has seen it.
+static WANTED: AtomicU64 = AtomicU64::new(0);
 
 /// A thread's calls go to the line.
 fn push_calls(bucket: Bucket) {
@@ -1110,16 +1122,18 @@ fn merge_calls(all: &mut Bucket, other: Bucket) {
 pub(crate) fn call_profile(name: &'static str, ns: u64) {
     CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
-        if WANTED.load(Relaxed) {
-            push_calls(std::mem::take(&mut calls.0));
+        let want = WANTED.load(Relaxed);
+        if calls.delivered != want {
+            calls.delivered = want;
+            push_calls(std::mem::take(&mut calls.bucket));
         }
-        match calls.0.iter_mut().find(|c| c.0 == name) {
+        match calls.bucket.iter_mut().find(|c| c.0 == name) {
             Some(c) => {
                 c.1 += 1;
                 c.2 += ns;
                 c.3 = c.3.max(ns);
             }
-            None => calls.0.push((name, 1, ns, ns)),
+            None => calls.bucket.push((name, 1, ns, ns)),
         }
     });
 }
@@ -1138,13 +1152,12 @@ fn short_call(name: &'static str) -> &'static str {
 /// Every thread's calls, merged into one table: this thread's bucket, then
 /// the ones the other threads handed over.
 fn take_calls() -> Bucket {
-    WANTED.store(true, Relaxed);
-    let mut all = CALLS.with(|calls| std::mem::take(&mut calls.borrow_mut().0));
+    WANTED.fetch_add(1, Relaxed);
+    let mut all = CALLS.with(|calls| std::mem::take(&mut calls.borrow_mut().bucket));
     let pushed: Vec<Bucket> = {
         let mut pushed = PUSHED.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *pushed)
     };
-    WANTED.store(false, Relaxed);
     for bucket in pushed {
         merge_calls(&mut all, bucket);
     }
