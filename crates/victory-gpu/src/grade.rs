@@ -8,17 +8,21 @@
 //! with the switch on and off says the place is right; any difference the
 //! curve shows afterwards is then the curve's.
 //!
-//! `VICTORY_GRADE=curve` records the same triangle with **one** tone curve
-//! and a croma, per RGB channel, alpha untouched. Below `VICTORY_GRADE_KNEE`
-//! (0.75 by default) a channel is written as it is; above it the range left
-//! between the knee and `VICTORY_GRADE_WHITE` (1.0 by default) is bent,
-//! continuously and monotonically, so the knee does not move and 1.0 writes
-//! the white ([`CURVE_SOURCE`] has the formula). After the curve the croma
-//! is pulled toward the channel's luminance by `VICTORY_GRADE_SAT` (1.0 by
-//! default, the identity). The four knobs are read once ([`curve`]) and
-//! handed to the pixel program as **root constants**, so they change without
-//! a rebuild; the identity records no constant at all and keeps its own
-//! pipeline.
+//! `VICTORY_GRADE=curve` records the same triangle with a black point, **one**
+//! tone curve and a croma, per RGB channel, alpha untouched. First the black
+//! point: `c = black + (1 - black) c` with `black` = `VICTORY_GRADE_BLACK`
+//! (0.0 by default, the exact identity), so the lowest code reaches `black`
+//! and 1.0 stays 1.0 — the white knob's threshold is not moved. Then, below
+//! `VICTORY_GRADE_KNEE` (0.75 by default) a channel is written as it is;
+//! above it the range left between the knee and `VICTORY_GRADE_WHITE` (1.0 by
+//! default) is bent, continuously and monotonically, so the knee does not
+//! move and 1.0 writes the white ([`CURVE_SOURCE`] has the formula). After
+//! the curve the croma is pulled toward the channel's luminance by
+//! `VICTORY_GRADE_SAT` (1.0 by default, the identity). The order is fixed:
+//! black, then the curve, then the croma. The five knobs are read once
+//! ([`curve`]) and handed to the pixel program as **root constants**, so they
+//! change without a rebuild; the identity records no constant at all and
+//! keeps its own pipeline.
 //!
 //! Where it goes, from the dumps (`_port/victory/seriesS_up`):
 //!
@@ -161,6 +165,16 @@ const STRENGTH: f32 = 2.0;
 /// monotone over the whole range.
 const STRENGTH_RANGE: (f32, f32) = (0.0, 20.0);
 
+/// The black point `VICTORY_GRADE_BLACK` defaults to: 0.0, which is the
+/// exact identity (`0 + 1 * c == c`, bit for bit), so the pass is the one of
+/// before until the knob moves.
+const BLACK: f32 = 0.0;
+
+/// The black point is allowed here, both ends included. Above 0.25 the
+/// picture's low quarter would be crushed into a flat black and the lift
+/// would start to read as a wash.
+const BLACK_RANGE: (f32, f32) = (0.0, 0.25);
+
 /// The value the white ends in (`VICTORY_GRADE_WHITE`): 1.0 writes the top
 /// of the range as white, which is the curve as it was before the knob.
 const WHITE: f32 = 1.0;
@@ -176,8 +190,10 @@ const SAT: f32 = 1.0;
 /// The saturation is allowed here, both ends included: 0.0 is grey.
 const SAT_RANGE: (f32, f32) = (0.0, 1.0);
 
-/// The four numbers the curve reads, as the pixel program sees them: `b0`,
-/// four dwords = 16 bytes.
+/// The five numbers the pass reads, as the pixel program sees them: `b0`,
+/// five dwords = 20 bytes. Root constants are dword-aligned, so the fifth
+/// needs no second block (a root constant signature only needs a multiple of
+/// 4 bytes, not of 16).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Knobs {
@@ -185,6 +201,7 @@ struct Knobs {
     strength: f32,
     white: f32,
     sat: f32,
+    black: f32,
 }
 
 /// The curve's knobs, read **once** from the environment ([`knob`]) and
@@ -198,6 +215,7 @@ fn curve() -> Knobs {
             strength: knob("VICTORY_GRADE_STRENGTH", STRENGTH, STRENGTH_RANGE),
             white: shoulder(knee, knob("VICTORY_GRADE_WHITE", WHITE, WHITE_RANGE)),
             sat: knob("VICTORY_GRADE_SAT", SAT, SAT_RANGE),
+            black: knob("VICTORY_GRADE_BLACK", BLACK, BLACK_RANGE),
         }
     })
 }
@@ -269,14 +287,22 @@ float4 ps(Out i) : SV_Target {
 }
 "#;
 
-/// The curve's program: the same triangle, one tone curve and a croma,
-/// alpha untouched.
+/// The curve's program: the same triangle, a black point, one tone curve and
+/// a croma, alpha untouched, in that order — black, then the curve, then the
+/// croma.
 ///
-/// Per channel, with `t = (c - knee) / (1 - knee)` and `s = strength`:
-/// `g(t) = t + s t^2 (1 - t) / (1 + s t)`, and the channel is written as
-/// `knee + (white - knee) g(t)` above the knee, as it is below it. Then
-/// `g(0) = 0` (the knee does not move), `g(1) = 1` (1.0 writes `white`) and
-/// `g'(0) = 1`; `s t^2 (1 - t)` is never negative, so for `s >= 0` the
+/// **First** the black point, per channel: `c = black + (1 - black) c`. It
+/// raises `0` to `black` and leaves `1.0` at exactly **1.0** (`black + (1 -
+/// black) = 1`, and with `black <= 0.25` the `f32` sum rounds to `1.0`), so
+/// the white's threshold is not moved; its slope is `1 - black > 0`, so it is
+/// monotone, and `black + (1 - black) c >= c` for every `0 <= c <= 1`, so it
+/// never darkens. `black = 0` is the exact identity (`0 + 1 * c == c`).
+///
+/// Then the tone curve, with `t = (c - knee) / (1 - knee)` and `s =
+/// strength`: `g(t) = t + s t^2 (1 - t) / (1 + s t)`, and the channel is
+/// written as `knee + (white - knee) g(t)` above the knee, as it is below it.
+/// Then `g(0) = 0` (the knee does not move), `g(1) = 1` (1.0 writes `white`)
+/// and `g'(0) = 1`; `s t^2 (1 - t)` is never negative, so for `s >= 0` the
 /// shoulder bends toward the white and never away, and `s = 0` is linear.
 /// With `white = 1.0` this is exactly the curve of before.
 ///
@@ -288,8 +314,8 @@ float4 ps(Out i) : SV_Target {
 /// never overshoot the min/max of the three — the desaturation cannot create
 /// a new clip.
 const CURVE_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0))"
-cbuffer Knobs : register(b0) { float knee; float strength; float white; float sat; };
+#define RS "RootConstants(num32BitConstants=5, b0), DescriptorTable(SRV(t0))"
+cbuffer Knobs : register(b0) { float knee; float strength; float white; float sat; float black; };
 Texture2D<float4> colour : register(t0);
 struct Out { float4 at : SV_Position; };
 // A triangle larger than the screen: three vertices, no buffer.
@@ -303,6 +329,9 @@ Out vs(uint id : SV_VertexID) {
 [RootSignature(RS)]
 float4 ps(Out i) : SV_Target {
     float4 c = colour.Load(int3(int2(i.at.xy), 0));
+    // The black point first: 0 reaches `black`, 1.0 stays exactly 1.0 (the
+    // white's threshold is not moved), monotone and never darker.
+    c.rgb = black + (1.0 - black) * c.rgb;
     // Where the channel sits above the knee: 0 at the knee, 1 at 1.0.
     float3 t = saturate((c.rgb - knee) / (1.0 - knee));
     // g(t): 0 at the knee, 1 at 1.0, slope 1 at the knee, and for
@@ -671,7 +700,8 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
             strength = pass.knobs.strength,
             white = pass.knobs.white,
             sat = pass.knobs.sat,
-            "the finished colour gets the highlight curve (VICTORY_GRADE=curve)"
+            black = pass.knobs.black,
+            "the finished colour gets the black point, the highlight curve and the croma (VICTORY_GRADE=curve)"
         ),
     });
     let l = &list.list;
@@ -752,16 +782,17 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
                     pass.views.GetGPUDescriptorHandleForHeapStart(),
                 );
             }
-            // The curve: b0 (knee, strength, white, sat) first, then the
-            // table.
+            // The curve: b0 (knee, strength, white, sat, black) first, then
+            // the table.
             Style::Curve => {
                 let knobs = [
                     pass.knobs.knee,
                     pass.knobs.strength,
                     pass.knobs.white,
                     pass.knobs.sat,
+                    pass.knobs.black,
                 ];
-                l.SetGraphicsRoot32BitConstants(0, 4, knobs.as_ptr().cast(), 0);
+                l.SetGraphicsRoot32BitConstants(0, 5, knobs.as_ptr().cast(), 0);
                 l.SetGraphicsRootDescriptorTable(
                     1,
                     pass.views.GetGPUDescriptorHandleForHeapStart(),
@@ -874,6 +905,12 @@ mod tests {
             rgb[1] + w * (l - rgb[1]),
             rgb[2] + w * (l - rgb[2]),
         ]
+    }
+
+    /// The shader's black point, mirrored in `f32` — the very arithmetic the
+    /// pixel program runs: `black + (1 - black) c`.
+    fn lift(c: f32, black: f32) -> f32 {
+        black + (1.0 - black) * c
     }
 
     /// `white = 1.0` is exactly the curve of before: the same values, not
@@ -1021,6 +1058,87 @@ mod tests {
         assert_eq!(super::shoulder(0.5, 0.5), 1.0);
         assert_eq!(super::shoulder(0.95, 0.5), 1.0);
         assert_eq!(super::shoulder(0.3, 0.5), 0.5);
+    }
+
+    /// `black = 0` is the exact identity of the pass: `0 + 1 * c == c`, bit
+    /// for bit, and with the defaults the curve and the croma see the same
+    /// numbers as the pass of before.
+    #[test]
+    fn black_zero_leaves_the_pass_as_it_was() {
+        for i in 0..=1000 {
+            let c = i as f32 / 1000.0;
+            assert_eq!(lift(c, 0.0).to_bits(), c.to_bits(), "{c}");
+        }
+        for c in [0.0f32, 1.0, 0.5, 0.75, 0.123_456_79, 1.0 / 255.0] {
+            assert_eq!(lift(c, 0.0).to_bits(), c.to_bits(), "{c}");
+        }
+        // The whole chain, defaults everywhere: the curve reads what it read
+        // before, so the pass writes what it wrote before.
+        for i in 0..=1000 {
+            let c = f64::from(i) / 1000.0;
+            let before = tone_before(c, 0.75, 2.0);
+            let now = tone(f64::from(lift(c as f32, 0.0)), 0.75, 2.0, 1.0);
+            assert!((now - before).abs() < 1e-7, "{c}: {now} vs {before}");
+        }
+    }
+
+    /// `c = 0` arrives in `black` and `c = 1` stays **exactly** 1.0 for every
+    /// allowed black — so the white's threshold is not moved, and the value
+    /// at 1 does not depend on the knob at all.
+    #[test]
+    fn the_black_point_raises_zero_to_black_and_keeps_one_in_place() {
+        assert_eq!(super::BLACK, 0.0);
+        assert_eq!(super::BLACK_RANGE, (0.0, 0.25));
+        for i in 0..=250 {
+            let black = i as f32 / 1000.0;
+            assert_eq!(lift(0.0, black), black, "black {black}");
+            assert_eq!(lift(1.0, black), 1.0, "black {black}");
+        }
+        for black in [0.0f32, 0.25, 0.1, 0.200_000_01, 0.123_456_79] {
+            assert_eq!(lift(0.0, black), black, "black {black}");
+            assert_eq!(lift(1.0, black), 1.0, "black {black}");
+        }
+        // The value at 1.0 is the same for every black: the knob lifts the
+        // black, it does not scale the top.
+        let top = lift(1.0, 0.25);
+        for i in 0..=250 {
+            assert_eq!(lift(1.0, i as f32 / 1000.0), top);
+        }
+    }
+
+    /// The black point never decreases and never darkens: `black + (1 -
+    /// black) c >= c` for every `0 <= c <= 1`, and it stays inside the range.
+    #[test]
+    fn the_black_point_is_monotone_and_never_darkens() {
+        for i in 0..=250 {
+            let black = i as f32 / 1000.0;
+            let mut last = 0.0f32;
+            for j in 0..=1000 {
+                let c = j as f32 / 1000.0;
+                let out = lift(c, black);
+                assert!(out >= last, "not monotone at {c} (black {black})");
+                assert!(out >= c, "darkened {c} (black {black}): {out}");
+                assert!(out <= 1.0, "{out} above one (black {black})");
+                last = out;
+            }
+        }
+    }
+
+    /// The black knob is a number inside 0.0-0.25 and nothing else; the
+    /// default is 0.0, and a value outside the range is refused (the default
+    /// is used and `knob` warns, never a silent clamp).
+    #[test]
+    fn the_black_knob_is_a_number_inside_its_range() {
+        let black = super::BLACK_RANGE;
+        assert_eq!(super::BLACK, 0.0);
+        assert_eq!(super::knob_of("0", black), Some(0.0));
+        assert_eq!(super::knob_of(" 0.25 ", black), Some(0.25));
+        assert_eq!(super::knob_of("0.1", black), Some(0.1));
+        for bad in [
+            "", " ", "-0.01", "0.26", "1", "black", "inf", "-inf", "NaN",
+        ] {
+            assert_eq!(super::knob_of(bad, black), None, "{bad:?} as a black");
+        }
     }
 
     /// The views name a concrete format: the image's own when it is one; the
