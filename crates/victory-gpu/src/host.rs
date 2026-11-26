@@ -8406,6 +8406,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::safecopy::line(frames);
+        crate::draw::heap_pass_line();
         if let Some(host) = host() {
             host.drain_messages();
         }

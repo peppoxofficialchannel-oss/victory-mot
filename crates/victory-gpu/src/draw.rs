@@ -419,6 +419,78 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+// The phase timing below is ported from the Kelvaroq engine
+// (`crates/victory-gpu/src/draw.rs`, the `HeapPhase`/`HeapTiming` schema),
+// GPL-3.0.
+/// The parts of a pass over the heap's buffer views ([`State::heap_buffers`])
+/// that `VICTORY_HEAP_TIMINGS=1` times apart: the loop over the slots, the
+/// spans rebuilt from the ranges, the wait before a refresh (the lock and
+/// the lookups) and its record, and the queue side of the pass over textures
+/// picked by index that runs inside it.
+#[derive(Clone, Copy)]
+enum HeapPhase {
+    Slots,
+    Spans,
+    RefreshWait,
+    RefreshRecord,
+    TextureQueue,
+}
+
+/// One pass's microseconds by phase, from its start: each `mark` closes the
+/// phase before it, so the phases are disjoint and sum to the elapsed time.
+struct HeapTiming {
+    start: std::time::Instant,
+    elapsed_us: u64,
+    phase_us: [u64; 5],
+    full_scan: bool,
+}
+
+impl HeapTiming {
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("VICTORY_HEAP_TIMINGS").is_some_and(|v| v == "1"))
+    }
+
+    fn new(start: std::time::Instant, full_scan: bool) -> Self {
+        Self { start, elapsed_us: 0, phase_us: [0; 5], full_scan }
+    }
+
+    fn finish_phase(&mut self, phase: HeapPhase, now: std::time::Instant) {
+        // Round cumulative timestamps before subtraction, so even sub-microsecond
+        // phases sum to exactly the reported total in the exported unit.
+        let elapsed = now.duration_since(self.start).as_micros() as u64;
+        self.phase_us[phase as usize] += elapsed - self.elapsed_us;
+        self.elapsed_us = elapsed;
+    }
+
+    fn mark(timing: &mut Option<Self>, phase: HeapPhase) {
+        if let Some(t) = timing {
+            t.finish_phase(phase, std::time::Instant::now());
+        }
+    }
+}
+
+/// The microseconds of the passes over the heap by phase ([`HeapPhase`]),
+/// and how many of them were the every-16 full scan; since the last frame
+/// line. Written only with `VICTORY_HEAP_TIMINGS=1`.
+static HEAP_PHASE_MICROS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static HEAP_FULL_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// The pass over the heap broken down by phase since the last call, one line
+/// (`VICTORY_HEAP_TIMINGS=1`; nothing when it is off).
+pub(crate) fn heap_pass_line() {
+    if !HeapTiming::enabled() {
+        return;
+    }
+    let [slots_us, spans_us, refresh_wait_us, refresh_record_us, texture_queue_us] =
+        HEAP_PHASE_MICROS.each_ref().map(|count| count.swap(0, Ordering::Relaxed));
+    let full = if HEAP_FULL_SCANS.swap(0, Ordering::Relaxed) > 0 { " full scan" } else { "" };
+    tracing::info!(
+        "heap buffer pass: {slots_us} slots, {spans_us} spans, {refresh_wait_us}+{refresh_record_us} refresh, {texture_queue_us} texture queue us{full}"
+    );
+}
+
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1656,8 +1728,11 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
+        let full = *passes % 16 == 0;
+        // `VICTORY_HEAP_TIMINGS=1`: timed from the loop over the slots on.
+        let mut timing = HeapTiming::enabled().then(|| HeapTiming::new(std::time::Instant::now(), full));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let slots = if full {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -1704,6 +1779,7 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        HeapTiming::mark(&mut timing, HeapPhase::Slots);
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1715,6 +1791,7 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        HeapTiming::mark(&mut timing, HeapPhase::Spans);
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1724,6 +1801,8 @@ impl State {
         // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        // The wait before a refresh: the lock above and, per span, the lookups.
+        HeapTiming::mark(&mut timing, HeapPhase::RefreshWait);
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
@@ -1745,10 +1824,21 @@ impl State {
                     }
                 }
             }
+            HeapTiming::mark(&mut timing, HeapPhase::RefreshWait);
             shadow.refresh(list, *from, to - from);
+            HeapTiming::mark(&mut timing, HeapPhase::RefreshRecord);
         }
         let textures_began = std::time::Instant::now();
-        self.heap_textures(list, heap, host);
+        self.heap_textures(list, heap, host, timing.as_mut());
+        // The pass's phases, for the line (`VICTORY_HEAP_TIMINGS=1`).
+        if let Some(t) = timing {
+            for (count, us) in HEAP_PHASE_MICROS.iter().zip(t.phase_us.iter().copied()) {
+                count.fetch_add(us, Ordering::Relaxed);
+            }
+            if t.full_scan {
+                HEAP_FULL_SCANS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1828,7 +1918,7 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        self.heap_textures(list, heap, host, None);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -1930,6 +2020,7 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
+        mut timing: Option<&mut HeapTiming>,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
@@ -1983,6 +2074,10 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let (due, census) = host.texture_slots_due(frame, 4096);
+        // `VICTORY_HEAP_TIMINGS=1`: how much of the pass the queue took.
+        if let Some(t) = timing.as_deref_mut() {
+            t.finish_phase(HeapPhase::TextureQueue, std::time::Instant::now());
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
