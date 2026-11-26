@@ -142,7 +142,8 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1,024): it
+/// was 16 and 512, and [`card_limits`] says why that changed.
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
@@ -164,7 +165,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// (on by default: `VICTORY_CARD_ROOM_FOR_BUFFERS=0` turns it off).
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
