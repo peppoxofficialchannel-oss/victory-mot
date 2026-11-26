@@ -8,6 +8,16 @@
 //! with the switch on and off says the place is right; any difference the
 //! curve shows afterwards is then the curve's.
 //!
+//! `VICTORY_GRADE=curve` records the same triangle with **one** curve and
+//! nothing else: a soft-knee compression of the highlights, per RGB
+//! channel, alpha untouched. Below `VICTORY_GRADE_KNEE` (0.75 by default) a
+//! channel is written as it is; above it the range left between the knee
+//! and white is bent toward white, continuously and monotonically, so the
+//! knee does not move and 1.0 still writes 1.0 ([`CURVE_SOURCE`] has the
+//! formula). The two knobs are read once ([`curve`]) and handed to the pixel
+//! program as **root constants**, so they change without a rebuild; the
+//! identity records no constant at all and keeps its own pipeline.
+//!
 //! Where it goes, from the dumps (`_port/victory/seriesS_up`):
 //!
 //! * the finished colour is **not one image**. The composite
@@ -65,20 +75,132 @@ pub(crate) const ENCODE: &str = "b30b0ce52e51bc0c";
 /// in its table, in dwords. From the listings: `b30b0ce52e51bc0c Srv s1+0`.
 pub(crate) const COLOUR: (u8, u32) = (1, 0);
 
-/// The one value `VICTORY_GRADE` takes for now: the pass that leaves the
+/// The one value `VICTORY_GRADE` takes for the pass that leaves the
 /// picture as it is.
 const IDENTITY: &str = "identity";
 
-/// Whether the identity pass is asked for (`VICTORY_GRADE=identity`, any
-/// case, spaces trimmed). Absent or anything else: off.
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_GRADE").is_ok_and(|set| is_identity(&set)))
+/// The value `VICTORY_GRADE` takes for the highlight curve.
+const CURVE: &str = "curve";
+
+/// Which pass `VICTORY_GRADE` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Style {
+    /// The same values read and written back: no constant, the pipeline of
+    /// [`SOURCE`].
+    Identity,
+    /// The soft-knee curve of [`CURVE_SOURCE`], fed by [`curve`].
+    Curve,
+}
+
+impl Style {
+    /// The word `VICTORY_GRADE` holds for this style, as the logs give it.
+    fn name(self) -> &'static str {
+        match self {
+            Style::Identity => IDENTITY,
+            Style::Curve => CURVE,
+        }
+    }
+}
+
+/// The pass `VICTORY_GRADE` asks for (`identity` or `curve`, any case,
+/// spaces trimmed). Absent or anything else: `None`, nothing is recorded.
+pub(crate) fn style() -> Option<Style> {
+    static STYLE: OnceLock<Option<Style>> = OnceLock::new();
+    *STYLE.get_or_init(|| {
+        std::env::var("VICTORY_GRADE")
+            .ok()
+            .as_deref()
+            .and_then(style_of)
+    })
 }
 
 /// Whether `set` (what the variable holds) asks for the identity.
 fn is_identity(set: &str) -> bool {
     set.trim().eq_ignore_ascii_case(IDENTITY)
+}
+
+/// Whether `set` asks for the curve.
+fn is_curve(set: &str) -> bool {
+    set.trim().eq_ignore_ascii_case(CURVE)
+}
+
+/// What `set` asks for; anything it does not know is `None`.
+fn style_of(set: &str) -> Option<Style> {
+    if is_identity(set) {
+        Some(Style::Identity)
+    } else if is_curve(set) {
+        Some(Style::Curve)
+    } else {
+        None
+    }
+}
+
+/// Whether any pass is asked for (`VICTORY_GRADE=identity|curve`, any case,
+/// spaces trimmed). Absent or anything else: off.
+pub(crate) fn on() -> bool {
+    style().is_some()
+}
+
+/// The knee `VICTORY_GRADE_KNEE` defaults to: below it a channel is written
+/// as it is, which leaves the low three quarters of the picture alone.
+const KNEE: f32 = 0.75;
+
+/// The knee is allowed here, both ends included. Above 0.95 the shoulder
+/// would be too thin to bend; below 0.3 it would reach into the midtones.
+const KNEE_RANGE: (f32, f32) = (0.3, 0.95);
+
+/// How hard the curve bends above the knee (`VICTORY_GRADE_STRENGTH`).
+/// 0 is the identity, 2 the default.
+const STRENGTH: f32 = 2.0;
+
+/// The strength is allowed here, both ends included: the curve stays
+/// monotone over the whole range.
+const STRENGTH_RANGE: (f32, f32) = (0.0, 20.0);
+
+/// The two numbers the curve reads, as the pixel program sees them: `b0`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Knobs {
+    knee: f32,
+    strength: f32,
+}
+
+/// The curve's knobs, read **once** from the environment ([`knob`]) and
+/// then carried to the shader as root constants.
+fn curve() -> Knobs {
+    static KNOBS: OnceLock<Knobs> = OnceLock::new();
+    *KNOBS.get_or_init(|| Knobs {
+        knee: knob("VICTORY_GRADE_KNEE", KNEE, KNEE_RANGE),
+        strength: knob("VICTORY_GRADE_STRENGTH", STRENGTH, STRENGTH_RANGE),
+    })
+}
+
+/// One knob: the variable's value when it parses into `range` (inclusive),
+/// otherwise `default` — a number outside the range or a word is not a
+/// value, and the log says the default was used.
+fn knob(name: &str, default: f32, range: (f32, f32)) -> f32 {
+    let Ok(set) = std::env::var(name) else {
+        return default;
+    };
+    let Some(value) = knob_of(&set, range) else {
+        tracing::warn!(
+            variable = name,
+            set,
+            default,
+            low = range.0,
+            high = range.1,
+            "no such value for the grade curve: the default is used"
+        );
+        return default;
+    };
+    value
+}
+
+/// `set` as a knob: a finite number inside `range` (inclusive), or `None`.
+/// The empty variable is `None` too, not zero.
+fn knob_of(set: &str, (low, high): (f32, f32)) -> Option<f32> {
+    let value: f32 = set.trim().parse().ok()?;
+    (value.is_finite() && (low..=high).contains(&value)).then_some(value)
 }
 
 const SOURCE: &str = r#"
@@ -102,7 +224,49 @@ float4 ps(Out i) : SV_Target {
 }
 "#;
 
+/// The curve's program: the same triangle, one curve, alpha untouched.
+///
+/// Per channel, with `t = (c - knee) / (1 - knee)` and `s = strength`:
+/// `g(t) = t + s t^2 (1 - t) / (1 + s t)`, and the channel is written as
+/// `knee + (1 - knee) g(t)` above the knee, as it is below it. Then
+/// `g(0) = 0` (the knee does not move), `g(1) = 1` (white stays white) and
+/// `g'(0) = 1` (no crease at the knee); `s t^2 (1 - t)` is never negative,
+/// so for `s >= 0` the highlight bends toward white and never away, and
+/// `s = 0` is the identity. Nothing else is touched.
+const CURVE_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0))"
+cbuffer Knobs : register(b0) { float knee; float strength; };
+Texture2D<float4> colour : register(t0);
+struct Out { float4 at : SV_Position; };
+// A triangle larger than the screen: three vertices, no buffer.
+[RootSignature(RS)]
+Out vs(uint id : SV_VertexID) {
+    float2 p = float2(float((id << 1) & 2), float(id & 2));
+    Out o;
+    o.at = float4(p * 2.0 - 1.0, 0.0, 1.0);
+    return o;
+}
+[RootSignature(RS)]
+float4 ps(Out i) : SV_Target {
+    float4 c = colour.Load(int3(int2(i.at.xy), 0));
+    // Where the channel sits above the knee: 0 at the knee, 1 at white.
+    float3 t = saturate((c.rgb - knee) / (1.0 - knee));
+    // g(t): 0 at the knee, 1 at white, slope 1 at the knee, and for
+    // strength >= 0 bent toward white.
+    float3 g = t + strength * t * t * (1.0 - t) / (1.0 + strength * t);
+    float3 bent = knee + (1.0 - knee) * g;
+    // Below the knee t is 0 and the texel is written as it is; alpha always.
+    c.rgb = lerp(c.rgb, bent, step(knee, c.rgb));
+    return c;
+}
+"#;
+
 struct Pass {
+    /// Which pass this is: it picks the shader, the root signature and the
+    /// constants the recording sets.
+    style: Style,
+    /// The curve's knobs; `Default` (and never set) for the identity.
+    knobs: Knobs,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     /// The shader-visible heap holding the one view the pass reads.
@@ -121,8 +285,9 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-/// One shader entry point of [`SOURCE`], compiled.
+/// One shader entry point of `source`, compiled.
 fn compile(
+    source: &str,
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
 ) -> windows::core::Result<Vec<u8>> {
@@ -131,8 +296,8 @@ fn compile(
     // SAFETY: the source and names live through the call; out pointers ours.
     let made = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("grade"),
             None,
             None,
@@ -154,7 +319,7 @@ fn compile(
                 )
             };
             tracing::warn!(
-                "the identity pass of the grade does not compile: {}",
+                "the grade pass does not compile: {}",
                 String::from_utf8_lossy(text)
             );
         }
@@ -173,9 +338,18 @@ fn make(
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    style: Style,
 ) -> windows::core::Result<Pass> {
-    let vs = compile(s!("vs"), s!("vs_5_1"))?;
-    let ps = compile(s!("ps"), s!("ps_5_1"))?;
+    let source = match style {
+        Style::Identity => SOURCE,
+        Style::Curve => CURVE_SOURCE,
+    };
+    let knobs = match style {
+        Style::Curve => curve(),
+        Style::Identity => Knobs::default(),
+    };
+    let vs = compile(source, s!("vs"), s!("vs_5_1"))?;
+    let ps = compile(source, s!("ps"), s!("ps_5_1"))?;
     let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
         pShaderBytecode: bytes.as_ptr().cast(),
         BytecodeLength: bytes.len(),
@@ -244,7 +418,7 @@ fn make(
         )?;
         let copy = copy.ok_or_else(windows::core::Error::empty)?;
         crate::host::name(&copy, || {
-            format!("grade identity {width}x{height} f{}", format.0)
+            format!("grade {} {width}x{height} f{}", style.name(), format.0)
         });
         let views: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -289,6 +463,8 @@ fn make(
             targets.GetCPUDescriptorHandleForHeapStart(),
         );
         Ok(Pass {
+            style,
+            knobs,
             root,
             pso,
             views,
@@ -313,12 +489,15 @@ fn subresource(texture: &ID3D12Resource) -> D3D12_TEXTURE_COPY_LOCATION {
     }
 }
 
-/// Records, in `list`, the identity pass over `image`: the image is read
-/// through `format` (`None`: the resource's own) and written back as it is.
-/// Returns whether anything was recorded (the list's targets, descriptor
-/// heap, root signature and pipeline are then ours, and the caller sets the
-/// title's again).
+/// Records, in `list`, the pass `VICTORY_GRADE` asks for over `image`: the
+/// image is read through `format` (`None`: the resource's own) and written
+/// back — as it is, or through the highlight curve. Returns whether anything
+/// was recorded (the list's targets, descriptor heap, root signature and
+/// pipeline are then ours, and the caller sets the title's again).
 pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> bool {
+    let Some(style) = style() else {
+        return false;
+    };
     let Some(host) = host() else {
         return false;
     };
@@ -351,7 +530,7 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     let Some(pass) = PASS
         .get_or_init(|| {
-            make(&host.device, d.Width as u32, d.Height as u32, format)
+            make(&host.device, d.Width as u32, d.Height as u32, format, style)
                 .inspect_err(|e| tracing::warn!(error = %e, "no grade (VICTORY_GRADE)"))
                 .ok()
         })
@@ -375,13 +554,21 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
         return false;
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::info!(
+    ONCE.call_once(|| match pass.style {
+        Style::Identity => tracing::info!(
             width = pass.width,
             height = pass.height,
             format = pass.format.0,
             "the finished colour is read and written back as it is (VICTORY_GRADE=identity)"
-        )
+        ),
+        Style::Curve => tracing::info!(
+            width = pass.width,
+            height = pass.height,
+            format = pass.format.0,
+            knee = pass.knobs.knee,
+            strength = pass.knobs.strength,
+            "the finished colour gets the highlight curve (VICTORY_GRADE=curve)"
+        ),
     });
     let l = &list.list;
     list.keep(&pass.copy);
@@ -419,7 +606,24 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
         l.SetPipelineState(&pass.pso);
         let target = pass.targets.GetCPUDescriptorHandleForHeapStart();
         l.OMSetRenderTargets(1, Some(&target as *const _), false, None);
-        l.SetGraphicsRootDescriptorTable(0, pass.views.GetGPUDescriptorHandleForHeapStart());
+        match pass.style {
+            // The identity: the one table, no constant at all.
+            Style::Identity => {
+                l.SetGraphicsRootDescriptorTable(
+                    0,
+                    pass.views.GetGPUDescriptorHandleForHeapStart(),
+                );
+            }
+            // The curve: b0 (knee, strength) first, then the table.
+            Style::Curve => {
+                let knobs = [pass.knobs.knee, pass.knobs.strength];
+                l.SetGraphicsRoot32BitConstants(0, 2, knobs.as_ptr().cast(), 0);
+                l.SetGraphicsRootDescriptorTable(
+                    1,
+                    pass.views.GetGPUDescriptorHandleForHeapStart(),
+                );
+            }
+        }
         // The input assembly is whatever the title's last draw left: these
         // three vertices are a triangle list (4, as `crate::draw` maps them).
         l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
@@ -462,34 +666,125 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
 
 #[cfg(test)]
 mod tests {
-    /// Only `identity` turns it on: absent, empty, off, a number or a
-    /// spelling it does not know leave the picture alone.
+    use super::Style;
+
+    /// `identity` and `curve` turn it on: anything else — absent, empty,
+    /// off, a number or a spelling it does not know — leaves the picture
+    /// alone.
     #[test]
-    fn the_switch_is_identity_and_nothing_else() {
+    fn the_switch_is_identity_or_curve_and_nothing_else() {
         assert!(super::is_identity("identity"));
         assert!(super::is_identity(" identity "));
         assert!(super::is_identity("IDENTITY"));
-        assert!(!super::is_identity(""));
-        assert!(!super::is_identity("off"));
-        assert!(!super::is_identity("0"));
-        assert!(!super::is_identity("1"));
-        assert!(!super::is_identity("identities"));
         assert!(!super::is_identity("curve"));
+        assert!(super::is_curve("curve"));
+        assert!(super::is_curve(" CURVE "));
+        assert!(super::is_curve("Curve"));
+        assert!(!super::is_curve("identity"));
+        for (set, wanted) in [
+            ("identity", Some(Style::Identity)),
+            (" Curve ", Some(Style::Curve)),
+            ("", None),
+            ("off", None),
+            ("0", None),
+            ("identities", None),
+            ("curves", None),
+        ] {
+            assert_eq!(super::style_of(set), wanted, "{set:?}");
+        }
     }
 
-    /// The pass compiles with the system's compiler and the host takes it
-    /// (a small copy, so the test needs no 1920x1080 allocation).
+    /// The knobs are numbers inside their range and nothing else; the
+    /// defaults are the ones the plan asks for.
     #[test]
-    fn identity_pass_builds() {
+    fn the_knobs_are_numbers_inside_their_range() {
+        let knee = super::KNEE_RANGE;
+        let strength = super::STRENGTH_RANGE;
+        assert_eq!(super::KNEE, 0.75);
+        assert_eq!(super::STRENGTH, 2.0);
+        // Accepted, both ends included, spaces trimmed.
+        assert_eq!(super::knob_of("0.75", knee), Some(0.75));
+        assert_eq!(super::knob_of(" 0.3 ", knee), Some(0.3));
+        assert_eq!(super::knob_of("0.95", knee), Some(0.95));
+        assert_eq!(super::knob_of("0", strength), Some(0.0));
+        assert_eq!(super::knob_of("20", strength), Some(20.0));
+        // Not numbers, or outside the range: no value, the default stands.
+        for bad in [
+            "", " ", "knee", "0.2", "0.96", "1", "0", "inf", "-inf", "NaN",
+        ] {
+            assert_eq!(super::knob_of(bad, knee), None, "{bad:?} as a knee");
+        }
+        for bad in ["", "word", "-1", "20.1", "inf", "NaN"] {
+            assert_eq!(super::knob_of(bad, strength), None, "{bad:?} as a strength");
+        }
+    }
+
+    /// The shader's curve on one channel, mirrored here (in `f64`, for the
+    /// step near the knee) so it can be checked without a GPU:
+    /// `t = (c - knee) / (1 - knee)` and
+    /// `g = t + s t^2 (1 - t) / (1 + s t)`, written as `knee + (1 - knee) g`
+    /// above the knee and as `c` below it.
+    fn tone(c: f64, knee: f64, strength: f64) -> f64 {
+        if c <= knee {
+            return c;
+        }
+        let t = (c - knee) / (1.0 - knee);
+        let g = t + strength * t * t * (1.0 - t) / (1.0 + strength * t);
+        knee + (1.0 - knee) * g
+    }
+
+    /// The two identities the curve must keep: the knee does not move (from
+    /// either side) and white stays white; the slope at the knee is the
+    /// identity's; it never decreases, never leaves the picture, and never
+    /// darkens.
+    #[test]
+    fn the_curve_keeps_the_knee_and_white_in_place() {
+        for knee in [0.3f64, 0.5, 0.75, 0.95] {
+            for strength in [0.0f64, 0.5, 2.0, 20.0] {
+                assert!((tone(knee, knee, strength) - knee).abs() < 1e-9);
+                let below = knee - 1e-4;
+                assert!((tone(below, knee, strength) - below).abs() < 1e-9);
+                assert!((tone(1.0, knee, strength) - 1.0).abs() < 1e-9);
+                // Soft knee: `g'(0) = 1`, so the knee has no crease. The
+                // step is in `t`, which the knee's place cannot distort.
+                let t = 1e-7;
+                let slope =
+                    (tone(knee + t * (1.0 - knee), knee, strength) - knee) / (t * (1.0 - knee));
+                assert!(
+                    (slope - 1.0).abs() < 1e-4,
+                    "knee {knee} strength {strength}: slope {slope}"
+                );
+                let mut last = 0.0f64;
+                for i in 0..=1000 {
+                    let c = f64::from(i) / 1000.0;
+                    let out = tone(c, knee, strength);
+                    assert!(out >= last - 1e-9, "not monotone at {c} (knee {knee})");
+                    assert!(out >= c - 1e-9, "darkened {c} (knee {knee})");
+                    assert!(out <= 1.0 + 1e-9, "{out} above white (knee {knee})");
+                    last = out;
+                }
+            }
+        }
+        // Strength 0 is the identity, everywhere.
+        for i in 0..=1000 {
+            let c = f64::from(i) / 1000.0;
+            assert!((tone(c, 0.75, 0.0) - c).abs() < 1e-12);
+        }
+    }
+
+    /// Both passes compile with the system's compiler and the host takes
+    /// them (small copies, so the tests need no 1920x1080 allocation). The
+    /// host is absent outside the game, where the test returns and the
+    /// shaders are checked by the compiler alone.
+    #[test]
+    fn the_passes_build() {
         let Some(host) = crate::host::host() else {
             return;
         };
-        super::make(
-            &host.device,
-            16,
-            16,
-            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM,
-        )
-        .expect("the identity pass");
+        let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
+        for style in [Style::Identity, Style::Curve] {
+            super::make(&host.device, 16, 16, format, style)
+                .unwrap_or_else(|e| panic!("the {style:?} pass: {e}"));
+        }
     }
 }
