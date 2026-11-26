@@ -6,9 +6,35 @@ files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
+The layer reimplements the console's own libraries, so a title compiled for the
+console finds what it imports: `xgameruntime` (the Xbox game runtime), the
+`d3d12_xs` variant of Direct3D 12, `xboxbvhbuilder`, DirectStorage and the
+file-system calls a Series title makes. Console shaders are translated to the
+host's shader model at load, and the console's memory model — virtual
+allocation, views, reservations — is presented to the title unchanged.
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
+
+## Status on the machine this branch is tuned for (2026-11-26)
+
+Windows 11, one laptop: NVIDIA RTX 3050 6 GB, 4,407 MB of local video budget,
+the Series S profile throughout. Not playable yet.
+
+| Stage | State here |
+|-------|-------------|
+| Boot, menus, start screen | works, the title's own 30 fps |
+| Opening cutscene | plays in order, lit |
+| The world | renders: characters, terrain, sky, HUD, pad input |
+| Frame rate in the world | about 3 to 4 frames per second; the fit `frame = intercept + slope * draws` over 142 logged frames gives a **267 ms** intercept |
+| Light in shadow | **lit by a stand-in**: the title's ray-traced bounce light does not run yet, so `VICTORY_AMBIENT=0.8` puts a constant in place of the resolve's output. Measured: pixels below a flat dark threshold on daylight frames 6.19% to 4.74%, contrast kept, no measurable cost |
+| Textures | most arrive; some surfaces in wide shots still read flat black, and a few patches of colour appear where memory was reused |
+| Stability | no crash, no device loss, in runs of 15 minutes |
+
+The 15-minute runs behind those numbers are the method: one variable changed per
+run, captures scored against a fixed rule, and the frame time compared only at
+equal draw counts.
 
 ## What this branch adds
 
