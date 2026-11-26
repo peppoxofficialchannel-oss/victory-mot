@@ -882,12 +882,14 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         let size = request.source_size as usize;
         // A file read into a title address is the kernel's write, and the
         // kernel does not fault into the GPU side's guard: a block guarded
-        // again between `kernel_will_write` and the read (the guard over all
-        // the views of a page protects other views from other threads) made
-        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
-        // at the failed request (runs amd-C and amd-C2, seconds after the
-        // world's first frame). It is read beside and copied in: our copy
-        // faults into the guard like the title's own writes.
+        // again between the telling and the read (the guard over all the
+        // views of a page protects other views from other threads) made the
+        // read fail with ERROR_INVALID_USER_BUFFER, and the title stops at
+        // the failed request (runs amd-C and amd-C2, seconds after the
+        // world's first frame). The blocks are now held open over the write
+        // (`kernel_will_write_held`); without the bounce it is read beside
+        // and copied in, our copy faulting into the guard like the title's
+        // own writes.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
         return into_destination(request, size, |out| {
             if !bounce {
@@ -1069,10 +1071,11 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Opens the guarded blocks and tells the GPU side a placed texture
-        // there changes. `fill` writes from user mode (a file read is read
-        // beside first, see `execute`), so a block guarded again meanwhile
-        // faults into the guard instead of failing the write.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // there changes. Held open over `fill`: it writes from user mode (a
+        // file read is read beside first, see `execute`), and a block
+        // guarded again meanwhile would fault in the read's own code, where
+        // the guards cannot take it.
+        let _writing = victory_gpu::kernel_will_write_held(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };

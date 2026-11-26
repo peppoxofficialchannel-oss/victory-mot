@@ -624,6 +624,19 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     runs(pages, offset, len).is_some()
 }
 
+/// Tells the GPU write watch that bytes `[offset, offset + len)` of `pages`
+/// are about to be written through a view of our own ([`write_physical`],
+/// [`page_window`]): the guarded blocks at every title address showing them
+/// are opened and kept open until the guards drop, after the write. The
+/// write is not the title's code and would not fault into the guards — it
+/// would simply die on a block still read-only — so it must be told first.
+fn writing_shown(pages: &[usize], offset: usize, len: usize) -> Vec<victory_gpu::KernelWrite> {
+    shown_at(pages, offset, len)
+        .into_iter()
+        .map(|(at, n)| victory_gpu::kernel_will_write_pages(at, n))
+        .collect()
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -633,6 +646,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    // Before the write, not after: the guards stay open over it.
+    let _writing = writing_shown(pages, offset, data.len());
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -647,11 +662,15 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
-/// would then copy.
+/// would then copy. The write-watch guards of the title addresses showing
+/// those bytes are held open until it is dropped too (they were told
+/// before the window was handed out).
 pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// Write-watch guards held open while the window is live.
+    _writing: Vec<victory_gpu::KernelWrite>,
 }
 
 impl PageWindow {
@@ -671,10 +690,15 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    // Told before the window is handed out, held until it is dropped: the
+    // decode is not the title's code and a guarded block under it would
+    // kill the run instead of faulting into the guards.
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
+        _writing: writing_shown(pages, offset, len),
     })
 }
 
@@ -723,7 +747,9 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 /// shows them (`victory_gpu::title_memory_written`; what it does with it
 /// is `VICTORY_PAGE_WRITES`' to say, and it counts either way). Call when
 /// the bytes are there, and without the page table's lock ([`shown_at`]
-/// takes and leaves it).
+/// takes and leaves it). The write itself was told first ([`writing_shown`],
+/// held over it): what is said here is the count and what `page_writes`
+/// asks, not the opening of the guards.
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     for (at, bytes) in shown_at(pages, offset, len) {
         victory_gpu::title_memory_written(at, bytes, true);

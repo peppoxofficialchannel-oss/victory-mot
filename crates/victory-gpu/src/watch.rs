@@ -540,6 +540,11 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Blocks a write told to us is under way over ([`KernelWrite`]): no
+    /// check guards them again read-only until that write ends. The write
+    /// does not fault into the handler (its code is not the title's), so a
+    /// guard re-armed under it kills the run where it stands.
+    busy: Vec<(usize, usize)>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -565,10 +570,18 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    busy: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Guards {
+    /// Whether a write told to us is under way over `block` ([`KernelWrite`]).
+    fn busy(&self, block: usize) -> bool {
+        self.busy.iter().any(|&(first, last)| (first..last).contains(&block))
+    }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -613,6 +626,15 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        if !g.busy.is_empty() && block < last && g.busy(block) {
+            // A write told to us is under way over it (`KernelWrite`): not
+            // taken again, and not reported until it ends, when its bytes
+            // are all there. A run of blocks up to it is guarded as it was.
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
+            }
+            continue;
+        }
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
@@ -645,9 +667,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// Whether `[start, end)` is view memory. The title's views lie in
 /// placeholders, mapped and unmapped block by block as it streams, so a
 /// range can begin in a block that is not mapped right now: the first
-/// pages of the range that are there decide. A range with nothing there
-/// counts as a view (its blocks are noted absent, and looked at again when
-/// the runtime maps them).
+/// pages of the range that are there decide. A range with nothing mapped
+/// counts as a view only as far as its holes are reserved placeholders
+/// (`MEM_RESERVE`), which is what the runtime maps again; free memory
+/// (`MEM_FREE`) is no view of the title's, and counting it as one tracked
+/// it (blocks noted absent, its pages reported written) — freed and then
+/// allocated again, it brought those notes to the process heap and its
+/// pages into the write journal, where a later allocation inherited them
+/// (`free_memory_is_not_tracked`).
 ///
 /// Looking at the first address only took such a range for "not a view":
 /// its copy was marked not watched for good and copied whole at every
@@ -656,11 +683,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
+    let mut placeholder = false;
     loop {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -677,10 +705,12 @@ fn is_view(start: usize, end: usize) -> bool {
         if info.State == MEM_COMMIT || !holes {
             return false;
         }
-        // A hole (a placeholder, or free): on to what follows it.
+        // A hole: a placeholder the runtime maps again, or free memory,
+        // which is no view. On to what follows it.
+        placeholder |= info.State == MEM_RESERVE;
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if next <= at || next >= end {
-            return true;
+            return placeholder;
         }
         at = next;
     }
@@ -747,7 +777,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || g.busy(block) {
         return;
     }
     let mut old = 0;
@@ -762,6 +792,35 @@ fn protect_alias(g: &mut Guards, block: usize) {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    if g.busy.is_empty() {
+        protect_free(g, from, to);
+        return;
+    }
+    // A block a write told to us is under way over (`KernelWrite`) is left
+    // as it is: guarding it again read-only would make that write fault in
+    // code that is not the title's, and the run would die there. It is
+    // guarded again by the first check after the write ends.
+    let mut cuts: Vec<(usize, usize)> = g
+        .busy
+        .iter()
+        .map(|&(first, last)| (first.max(from), last.min(to)))
+        .filter(|&(first, last)| first < last)
+        .collect();
+    cuts.sort_unstable();
+    let mut at = from;
+    for (first, last) in cuts {
+        if first > at {
+            protect_free(g, at, first);
+        }
+        at = at.max(last);
+    }
+    if at < to {
+        protect_free(g, at, to);
+    }
+}
+
+/// [`protect_here`] of a range no write is under way over.
+fn protect_free(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -942,15 +1001,101 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     opened
 }
 
+/// Before a write into title memory `[at, at + len)` the guards do not see
+/// (the kernel's, which does not fault into our handler): the guarded blocks
+/// there are open while this lives, and no check guards them again under the
+/// write. Dropped, the blocks it opened are made read-only again (where
+/// they are still view memory) and stay not clean: the next check reports
+/// the write to every copy of them, which takes the bytes that are there.
+#[must_use = "the write must happen while this lives"]
+pub struct KernelWrite {
+    first: usize,
+    last: usize,
+    /// Blocks it opened and must guard again.
+    opened: Vec<usize>,
+}
+
+/// Opens the guarded blocks of `[at, at + len)` and keeps them open until
+/// the result is dropped ([`KernelWrite`]).
+fn hold(at: usize, len: usize) -> KernelWrite {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    let mut opened = Vec::new();
+    if first < last {
+        // Before the first byte lands: from here no check guards these
+        // blocks again, whatever it finds written in them.
+        g.busy.push((first, last));
+        let before: Vec<usize> = g.protected.range(first..last).copied().collect();
+        open(&mut g, at, at.saturating_add(len));
+        opened = before.into_iter().filter(|&block| !g.protected.contains(&block)).collect();
+    }
+    KernelWrite { first, last, opened }
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        };
+        let mut g = guards();
+        if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
+            g.busy.swap_remove(i);
+        }
+        for &block in &self.opened {
+            // View memory only, as `protect_here` decides block by block: a
+            // block the runtime remapped to private memory meanwhile must
+            // not be made read-only (the heap's own writes then fault).
+            // SAFETY: plain data filled in by the query, of the right size.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 || info.State != MEM_COMMIT || info.Type != MEM_MAPPED {
+                g.clean.remove(&block);
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+                // Read-only again, still not clean: the next check reports
+                // the write. Guarded and clean, the copies would keep the
+                // bytes from before it.
+                g.protected.insert(block);
+            }
+            g.clean.remove(&block);
+        }
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// reads into its own memory. The blocks are left open (noted written):
+/// this is the telling of a write, not a guard over one.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// Before a write into title memory `[at, at + len)` that goes around the
+/// guards and does not fault into our handler — DirectStorage writing
+/// physical pages through a view of its own, at the addresses the title has
+/// them mapped (`victory_hle::xmem`'s `page_window`, `write_physical`): the
+/// guarded blocks there must be open **before** the first byte lands, since
+/// the write is not the title's code and a fault in it is not ours to take.
+/// The result holds them open to the end of the write. The texture pass is
+/// not told here: what the write wrote is said when it is done
+/// ([`title_memory_written`], which stays for the count).
+pub fn will_write(at: usize, len: usize) -> KernelWrite {
+    hold(at, len)
+}
+
+/// [`will_write`], and the placed textures there are noted as about to
+/// change (the kernel's `ReadFile` and `fread` into the title's own memory).
+pub fn writing_held(at: usize, len: usize) -> KernelWrite {
+    let guard = hold(at, len);
+    crate::descriptor::host::remapped(at, len);
+    guard
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
@@ -989,9 +1134,11 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 /// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
 /// through a view of the runtime's own, and this is an address where the
 /// title has those pages mapped (no title address faulted, nothing was
-/// mapped or unmapped; the shortcut this file's header names). Otherwise a
-/// read to a plain address has finished, of which [`writing`] was told
-/// before it began.
+/// mapped or unmapped; the shortcut this file's header names). Such a write
+/// was told to the watch before it began ([`will_write`]), which held its
+/// blocks open; this counts it and does what [`page_writes`] says once its
+/// bytes are there. Otherwise a read to a plain address has finished, of
+/// which [`writing`] was told before it began.
 ///
 /// Upstream's c75fdba does the same for its trackers (its `Writing` marks
 /// the pages once more when dropped; page destinations are reported at
@@ -1401,8 +1548,9 @@ mod tests {
             !read(&mut file),
             "the kernel does not fault into our handler"
         );
-        writing(view + 100, 13);
+        let writing = writing(view + 100, 13);
         assert!(read(&mut file));
+        drop(writing);
         // SAFETY: the bytes just read.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
@@ -1748,12 +1896,40 @@ mod tests {
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
-        writing(other + BLOCK, BLOCK);
+        drop(writing(other + BLOCK, BLOCK));
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
-        writing(other + BLOCK / 2, BLOCK);
+        drop(writing(other + BLOCK / 2, BLOCK));
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A write told to the watch *before* it lands (`will_write`, the path
+    /// of DirectStorage's page writes): its blocks are open while the guard
+    /// lives — a check under way neither guards them again (the write's own
+    /// code would die on a read-only block) nor reports them half written —
+    /// and when the guard falls they are read-only again, not clean, and
+    /// the write is reported once.
+    #[test]
+    fn a_write_told_before_it_lands_is_held_open_until_its_guard_falls() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        let writing = will_write(guarded + BLOCK, BLOCK);
+        assert!(writable(guarded + BLOCK), "open before the write");
+        assert!(!writable(guarded), "the block beside it stays guarded");
+        // A check while the write is under way leaves its block alone.
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "under way: nothing taken");
+        assert!(writable(guarded + BLOCK), "still open");
+        // SAFETY: the block we opened.
+        unsafe { ((guarded + BLOCK + 8) as *mut u8).write(0x5a) };
+        drop(writing);
+        assert!(!writable(guarded + BLOCK), "guarded again when the guard falls");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "the write is reported once");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -1809,7 +1985,7 @@ mod tests {
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;
-        writing(top, PAGE);
+        drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
     }
 }
