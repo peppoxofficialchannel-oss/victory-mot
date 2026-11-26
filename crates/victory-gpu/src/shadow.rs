@@ -2857,7 +2857,13 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
-                crate::watch::writing(start + at, n);
+                // Opened and *held* until the last run has landed: what
+                // writes here is our own copy, and a check running on
+                // another thread (`crate::watch::guard`) would arm the
+                // block read-only again under it. `writing` opened alone,
+                // which is enough for the kernel's own writes (their bytes
+                // are in before the call returns) and not for this one.
+                let _open = crate::watch::writing_held(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
@@ -2957,7 +2963,10 @@ impl Shadow {
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
-        crate::watch::writing(start + at, n);
+        // Held until the write below is done, as in `copy_back_with`: a
+        // check on another thread must not arm the block read-only under
+        // our own copy.
+        let _open = crate::watch::writing_held(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
@@ -3629,7 +3638,8 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
-                crate::watch::writing(start + at, n);
+                // Held until the write below is done, as in `copy_back_with`.
+                let _open = crate::watch::writing_held(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -3712,7 +3722,10 @@ impl Shadow {
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
-        crate::watch::writing(start + at, n);
+        // Held until the write below is done, as in `copy_back_with`: a
+        // check on another thread must not arm the block read-only under
+        // our own copy.
+        let _open = crate::watch::writing_held(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n

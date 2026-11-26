@@ -1933,7 +1933,67 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
-    /// Both views of the pages are checked, each for a copy of its own
+    /// The copy-back's own write of a stretch into title memory
+    /// (`crate::shadow::Shadow::copy_back_with`, `relay_merge`): the 64 KiB
+    /// blocks it covers are opened before the `memcpy` and *held* open until
+    /// it is done (`writing_held`), so a check running on another thread
+    /// neither arms them read-only under the copy nor reports them half
+    /// written. When the hold falls they are read-only again, not clean, and
+    /// the write is reported once: no block is left open and none is left
+    /// to be reported twice.
+    #[test]
+    fn a_copy_back_holds_its_stretch_open_until_the_memcpy_is_done() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let protection = |at: usize| {
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+            // SAFETY: plain data filled in by the query, of the right size.
+            unsafe {
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(at as *const _, &mut info, size_of_val(&info)), 0);
+                info.Protect
+            }
+        };
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        // One stretch as `back_piece` gives it: the whole second block, the
+        // bytes of the copy's scratch.
+        let bytes: Vec<u8> = (0..BLOCK).map(|i| (i * 7 + 3) as u8).collect();
+        {
+            let held = writing_held(guarded + BLOCK, BLOCK);
+            // A check under way (another thread's refresh) leaves the
+            // stretch alone and takes nothing: `writing` — opened, not
+            // held — would have armed the block read-only again here.
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "under way: nothing taken");
+            assert!(writable(guarded + BLOCK), "still open for the copy-back");
+            // The copy-back's write: a `memcpy` into title memory.
+            // SAFETY: the block we opened, and the buffer above.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (guarded + BLOCK) as *mut u8, BLOCK) };
+            drop(held);
+        }
+        // Read-only again at both blocks, the write reported once, then
+        // never again: nothing is left open.
+        assert_eq!(
+            protection(guarded),
+            windows_sys::Win32::System::Memory::PAGE_READONLY,
+            "the block beside the write is still guarded"
+        );
+        assert_eq!(
+            protection(guarded + BLOCK),
+            windows_sys::Win32::System::Memory::PAGE_READONLY,
+            "armed again when the hold falls"
+        );
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "the write is reported once");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "and nothing else is written");
+        // What the memcpy put there is what the title reads now.
+        // SAFETY: the view, read through the guarded address.
+        let landed = unsafe { std::slice::from_raw_parts((guarded + BLOCK) as *const u8, BLOCK) };
+        assert_eq!(landed, &bytes[..]);
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+
     /// (the title shows one physical page at several addresses, and each
     /// address has its host copy): a write through either is reported at
     /// both, whichever is checked first. Guarding the pages for the first
