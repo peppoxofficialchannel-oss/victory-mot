@@ -1187,6 +1187,31 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture pinned while the caller copies it ([`alias_of`]): one
+/// more reference, which [`Pinned::drop`] gives back. The title may let go
+/// of its own reference once the lookup returns, and the copy still needs
+/// the texture (its host side and its memory).
+#[cfg(windows)]
+pub(crate) struct Pinned(This);
+
+#[cfg(windows)]
+impl Pinned {
+    /// The texture the pin keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // The pin is a reference like the title's: the last one frees the
+        // texture. `Resource::drop` takes `TARGETS_AT`'s lock, so a pin
+        // must not be dropped while that lock is held.
+        let _ = object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1215,8 +1240,11 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// all zeros from a first stage that held light (run 88).
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
+///
+/// The source comes back pinned ([`Pinned`]): under the table's lock, so
+/// the title cannot let go of it between the lookup and the copy.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Pinned> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1253,7 +1281,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    same.then_some(other)
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
+    if !same || !object::add_ref_alive(other) {
+        return None;
+    }
+    Some(Pinned(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -3410,6 +3443,71 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// The source a placed view aliases is pinned while the caller copies
+    /// it: the title may let go of its own reference between the lookup and
+    /// the copy (or a recording thread may), and the copy still needs it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Some(_host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &source_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(source).data() as u64,
+                &texture(4, 4, 67, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let pinned = alias_of(view).expect("an alias source");
+        assert_eq!(pinned.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        resource_release(source);
+        assert!(
+            host_resource(pinned.get()).is_some(),
+            "a pinned source is still copyable"
+        );
+        assert!(
+            textures().contains(&(source as usize)),
+            "the pinned source is not freed"
+        );
+        drop(pinned);
+        assert!(
+            !textures().contains(&(source as usize)),
+            "the last reference frees it"
+        );
+        resource_release(view);
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

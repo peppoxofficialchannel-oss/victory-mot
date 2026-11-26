@@ -71,6 +71,24 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// A new reference to `this` if it is alive (its count is not zero): for a
+/// caller that needs an object past the point where the title may let go
+/// of its own reference (a texture a placed view aliases, copied after the
+/// lookup). False for a null pointer or an object already freed, so a pin
+/// never revives one.
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: `this` is one of our objects, still alive here (the tables
+    // that name objects drop their entry before freeing them).
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        n.checked_add(1).filter(|_| n > 0)
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;

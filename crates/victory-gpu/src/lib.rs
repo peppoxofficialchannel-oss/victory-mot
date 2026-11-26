@@ -104,3 +104,11 @@ pub use watch::{
     KernelWrite, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     will_write as kernel_will_write_pages, writing as kernel_will_write, writing_held as kernel_will_write_held,
 };
+
+/// Whether this build of the GPU crate has its own diagnostics feature.
+///
+/// The switches that only exist with it — the per-call profile, the list-call timings, the trace spans — are compiled
+/// out without it, while the log lines that print them stay in and read **zero**: a run then looks measured and is not.
+/// Found on 26/11, when VICTORY_CALL_PROFILE=1 printed "none recorded" for a whole run. It is logged once with the
+/// swap chain, so no run is ambiguous again.
+pub(crate) const DIAGNOSTICS: bool = cfg!(feature = "diagnostics");
