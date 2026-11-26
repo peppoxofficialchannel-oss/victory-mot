@@ -3099,6 +3099,15 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        // The finished colour, read and written back as it is, before the
+        // 8-bit encode reads it (`VICTORY_GRADE`): the pass binds its own
+        // views, targets and pipeline, so the title's are set again after
+        // it.
+        if self.grade(list) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "grade identity: the colour read and written back".to_owned());
+            self.replay(list);
+        }
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -3164,6 +3173,62 @@ impl State {
             return false;
         };
         crate::exposure::after_draw(list, target as This)
+    }
+
+    /// Before a draw of the title's 8-bit encode: the finished colour image
+    /// that draw samples is read and written back as it is
+    /// ([`crate::grade`], `VICTORY_GRADE`). Whether anything was recorded.
+    ///
+    /// The encode (`b30b0ce52e51bc0c`, [`crate::grade::ENCODE`]) is the
+    /// last reader of the whole colour, and the dumps of
+    /// `_port/victory/seriesS_up` show it is the only place that is after
+    /// every writer: the composite writes `0x1f68fe5aa30`, `43b4c00d725ac9c7`
+    /// **reads** it into `0x1f68fe5cab0` and `5510a9fd27ceb4b1` writes that
+    /// one again, and the encode samples whichever the title last left the
+    /// colour in (frame 3505: `0x1f68fe5aa30`; 3509, 3533, 3583:
+    /// `0x1f68fe5cab0`). Taking the image from the encode's own table
+    /// follows the colour wherever it goes.
+    fn grade(&self, list: &HostList) -> bool {
+        if !crate::grade::on() {
+            return false;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let Some(stage) = p
+            .stages
+            .iter()
+            .find(|s| s.shader.hash == crate::grade::ENCODE)
+        else {
+            return false;
+        };
+        let (slot, offset) = crate::grade::COLOUR;
+        let named = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Srv
+                && u.root == RootType::Table
+                && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        if !named {
+            return false;
+        }
+        let table = match self.roots_ref(false).get(usize::from(slot)) {
+            Some(Root::Table(table)) => *table,
+            _ => return false,
+        };
+        // A plain 2D view (dimension 4) says which format the encode reads
+        // it as; the resource's own is used when the title gave none.
+        let (image, format) = match crate::descriptor::view(table + u64::from(offset) * 4) {
+            Some(View::Shader(image, desc)) if image != 0 => {
+                let format = match desc {
+                    Some([format, 4, ..]) => Some(format),
+                    Some(_) => return false,
+                    None => None,
+                };
+                (image, format)
+            }
+            _ => return false,
+        };
+        crate::grade::before_draw(list, image as This, format)
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
