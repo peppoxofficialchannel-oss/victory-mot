@@ -442,11 +442,14 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // Taken at the ingress, so that a call which fails (the recursion of
+    // `ask_run` halves its way here) is timed from its start too: one clock
+    // pair per call, always (2,644 calls a frame: about 0.1 ms).
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -458,6 +461,13 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::WatchAsked, 1);
+        add(C::WatchAskedFailed, failed as u64);
+        add(C::WatchAskUs, started.elapsed().as_micros() as u64);
+    }
     if failed {
         return false;
     }
