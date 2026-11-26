@@ -3,9 +3,10 @@
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -454,6 +455,33 @@ mod own_tests {
         assert!(OWN[7].load(Relaxed) >= 1);
         drop(block);
         assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
+    }
+}
+
+#[cfg(test)]
+mod call_profile_tests {
+    use super::{call_profile, call_profile_line};
+
+    /// Each thread keeps its own bucket; the line merges them, so two
+    /// threads' calls of the same method are summed on one entry.
+    #[test]
+    fn calls_of_two_threads_are_summed() {
+        let thread = || {
+            std::thread::spawn(|| {
+                call_profile("prova::uno", 1_000);
+                call_profile("prova::uno", 3_000);
+                call_profile("prova::due", 500);
+            })
+        };
+        let (a, b) = (thread(), thread());
+        a.join().unwrap();
+        b.join().unwrap();
+        let line = call_profile_line(1.0);
+        // Four calls of "uno" (two a thread, 4 us in all), two of "due".
+        assert!(line.contains("prova::uno 4x 2.0 avg 3 max 88.9%"), "{line}");
+        assert!(line.contains("prova::due 2x 0.5 avg 0 max 11.1%"), "{line}");
+        assert!(!line.contains("altri"), "{line}");
+        println!("{line}");
     }
 }
 
@@ -1014,6 +1042,168 @@ pub(crate) fn recorded(started: std::time::Instant) {
     }
 }
 
+/// Whether list calls are timed by the method that records them
+/// (`VICTORY_CALL_PROFILE=1`). Off unless asked: with it off the recording
+/// runs as before, one relaxed load of a `OnceLock` per call.
+/// The profile adds work: two clock reads and a thread-local update per
+/// call, so its milliseconds are an upper bound of the recording, to be
+/// read in proportion, not the recording's true time.
+pub(crate) fn call_profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CALL_PROFILE").as_deref() == Ok("1"))
+}
+
+/// One thread's recorded calls, by the method that made them: calls,
+/// nanoseconds in all, and the longest call's nanoseconds. The names are
+/// the closures' type names (some thirty of them: `list::state::
+/// graphics_view` and the like), so a linear search is enough.
+type Bucket = Vec<(&'static str, u64, u64, u64)>;
+
+/// A thread's bucket. Each recording thread adds to its own without a lock
+/// (38,000 calls a frame would otherwise contend and distort the very
+/// ranking the profile is for); it is handed to the line when the line
+/// asks ([`WANTED`]) and when the thread ends.
+struct Calls(Bucket);
+
+impl Drop for Calls {
+    fn drop(&mut self) {
+        push_calls(std::mem::take(&mut self.0));
+    }
+}
+
+thread_local! {
+    /// This thread's calls since it last handed them to the line.
+    static CALLS: RefCell<Calls> = const { RefCell::new(Calls(Vec::new())) };
+}
+
+/// Buckets handed over by the threads: merged into the line's table.
+static PUSHED: Mutex<Vec<Bucket>> = Mutex::new(Vec::new());
+
+/// Set while a line is being made: each thread hands its bucket over at
+/// its next recorded call, so a thread recording for the whole run is seen
+/// without a lock in the hot path.
+static WANTED: AtomicBool = AtomicBool::new(false);
+
+/// A thread's calls go to the line.
+fn push_calls(bucket: Bucket) {
+    if bucket.is_empty() {
+        return;
+    }
+    PUSHED.lock().unwrap_or_else(|e| e.into_inner()).push(bucket);
+}
+
+/// Adds `other`'s calls into `all`.
+fn merge_calls(all: &mut Bucket, other: Bucket) {
+    for (name, calls, ns, longest) in other {
+        match all.iter_mut().find(|c| c.0 == name) {
+            Some(c) => {
+                c.1 += calls;
+                c.2 += ns;
+                c.3 = c.3.max(longest);
+            }
+            None => all.push((name, calls, ns, longest)),
+        }
+    }
+}
+
+/// A recorded list call made by `name` took `ns`.
+pub(crate) fn call_profile(name: &'static str, ns: u64) {
+    CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        if WANTED.load(Relaxed) {
+            push_calls(std::mem::take(&mut calls.0));
+        }
+        match calls.0.iter_mut().find(|c| c.0 == name) {
+            Some(c) => {
+                c.1 += 1;
+                c.2 += ns;
+                c.3 = c.3.max(ns);
+            }
+            None => calls.0.push((name, 1, ns, ns)),
+        }
+    });
+}
+
+/// A closure's type name as the call profile line shows it: without the
+/// crate and the `::{{closure}}` tail (`victory_gpu::list::state::
+/// graphics_view::{{closure}}` is `state::graphics_view`).
+fn short_call(name: &'static str) -> &'static str {
+    let name = name.strip_suffix("::{{closure}}").unwrap_or(name);
+    match name.find("::list::") {
+        Some(at) => &name[at + "::list::".len()..],
+        None => name,
+    }
+}
+
+/// Every thread's calls, merged into one table: this thread's bucket, then
+/// the ones the other threads handed over.
+fn take_calls() -> Bucket {
+    WANTED.store(true, Relaxed);
+    let mut all = CALLS.with(|calls| std::mem::take(&mut calls.borrow_mut().0));
+    let pushed: Vec<Bucket> = {
+        let mut pushed = PUSHED.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pushed)
+    };
+    WANTED.store(false, Relaxed);
+    for bucket in pushed {
+        merge_calls(&mut all, bucket);
+    }
+    all
+}
+
+/// The list methods by the time they took since the last line, ten of them
+/// and the rest as one: calls a frame, the average and longest call in
+/// microseconds, and the share of the recording. All threads' buckets are
+/// merged, so the line is the one table it always was.
+/// The profile adds work (two clock reads and a thread-local update per
+/// call): its milliseconds are an upper bound of the recording, to be read
+/// in proportion.
+fn call_profile_line(frames: f64) -> String {
+    let mut all = take_calls();
+    if all.is_empty() {
+        return "list calls by method (VICTORY_CALL_PROFILE): none recorded".into();
+    }
+    all.sort_by_key(|c| std::cmp::Reverse(c.2));
+    let total: u64 = all.iter().map(|c| c.2).sum();
+    let pct = |ns: u64| if total == 0 { 0.0 } else { ns as f64 * 100.0 / total as f64 };
+    let mut text: Vec<String> = all
+        .iter()
+        .take(10)
+        .map(|&(name, calls, ns, longest)| {
+            format!(
+                "{} {:.0}x {:.1} avg {:.0} max {:.1}%",
+                short_call(name),
+                calls as f64 / frames,
+                ns as f64 / calls.max(1) as f64 / 1e3,
+                longest as f64 / 1e3,
+                pct(ns)
+            )
+        })
+        .collect();
+    if all.len() > 10 {
+        let (calls, ns, longest) = all[10..].iter().fold((0u64, 0u64, 0u64), |(c, n, l), e| {
+            (c + e.1, n + e.2, l.max(e.3))
+        });
+        text.push(format!(
+            "altri ({}) {:.0}x {:.1} avg {:.0} max {:.1}%",
+            all.len() - 10,
+            calls as f64 / frames,
+            ns as f64 / calls.max(1) as f64 / 1e3,
+            longest as f64 / 1e3,
+            pct(ns)
+        ));
+    }
+    format!(
+        "list calls by method (VICTORY_CALL_PROFILE), {:.1} ms a frame of recording: {}",
+        total as f64 / 1e6 / frames,
+        text.join("; ")
+    )
+}
+
+fn log_call_profile(frames: f64) {
+    tracing::info!("  {}", call_profile_line(frames));
+}
+
 /// A submission is called on this thread (before it waits for the
 /// submission lock).
 pub(crate) fn submission_begins() {
@@ -1095,6 +1285,13 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    // Searches of the ring of dynamic slots that found their run only from
+    // the start, past `next` (none with `diagnostics` off: not counted).
+    #[cfg(feature = "diagnostics")]
+    let from_start =
+        crate::descriptor::host::DYNAMIC_WHY[3].load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let from_start = 0;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
@@ -1128,7 +1325,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         refused, {:.1} ms searching ({:.0} from the start); notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1139,6 +1336,7 @@ pub(crate) fn log(frames: f64) {
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
         c[C::DynamicNs as usize] / 1e6,
+        from_start,
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],
@@ -1152,6 +1350,9 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    if call_profile_on() {
+        log_call_profile(frames);
+    }
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(

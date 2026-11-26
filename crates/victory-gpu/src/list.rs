@@ -142,12 +142,28 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU. VICTORY_ABLATE=record skips the recording of the call
 /// (`f`) but not a list's reset, which goes through [`with_state_always`].
+/// With `VICTORY_CALL_PROFILE=1` (diagnostics builds) the call is timed
+/// and summed under the name of the closure's type, which is the method
+/// that made it (`...::state::graphics_view::{{closure}}`).
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+fn with_state<F>(this: This, f: F)
+where
+    F: FnOnce(&crate::host::HostList, &mut crate::draw::State),
+{
     if crate::ablate::ablated(crate::ablate::RECORD) {
         return;
     }
     let _record = crate::trace::span("record");
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::call_profile_on() {
+        let started = std::time::Instant::now();
+        with_state_always(this, f);
+        crate::copystat::call_profile(
+            std::any::type_name::<F>(),
+            started.elapsed().as_nanos() as u64,
+        );
+        return;
+    }
     with_state_always(this, f);
 }
 

@@ -3321,19 +3321,8 @@ impl Shadow {
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
                 if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
+                    if !self.card_put_title(at, title, runs_left) {
                         return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3366,6 +3355,47 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// [`Shadow::merge_under_writes`] for a copy in the card's memory: the
+    /// title's bytes `title`, read at offset `at` of the copy, go into its
+    /// CPU side where they differ from it, and those runs are noted for the
+    /// card side. False, with nothing done, if they cost more than
+    /// `runs_left` (a run each, or one for a page that goes up with a mask,
+    /// [`crate::card_mask`]); else they are taken from it. The caller holds
+    /// the lock of the copy's reference.
+    pub(crate) fn card_put_title(&self, at: usize, title: &[u8], runs_left: &mut usize) -> bool {
+        let n = title.len();
+        // SAFETY: inside the mapping of the copy's CPU side, which only
+        // the submitting thread writes.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        let runs = joined_over(changed_runs(title, held), merge_gap());
+        let size = self.card.as_ref().map_or(0, |c| c.size);
+        let cost = crate::card_mask::cost(runs.len(), self.start as usize, size);
+        if cost > *runs_left {
+            return false;
+        }
+        *runs_left -= cost;
+        if cost < runs.len() {
+            // A page that goes up with a mask: outside its runs the CPU
+            // side holds the title's bytes already, so the page is copied
+            // whole, and its runs are noted under one lock.
+            held.copy_from_slice(title);
+            self.card_changed_runs(at, &runs);
+            MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            MERGED[2].fetch_add(
+                runs.iter().map(|r| r.1 as u64).sum::<u64>(),
+                Ordering::Relaxed,
+            );
+            return true;
+        }
+        for (r, m) in runs {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+            self.card_changed(at + r, at + r + m);
+            MERGED[1].fetch_add(1, Ordering::Relaxed);
+            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+        }
+        true
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -3583,6 +3613,28 @@ impl Shadow {
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
+        }
+    }
+
+    /// [`Shadow::card_changed`] for runs (offset, bytes) from `at`, in
+    /// order and apart, under one lock.
+    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.reserve(runs.len());
+        for &(r, m) in runs {
+            let (from, to) = (at + r, at + r + m);
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => {
+                    *last = (last.0.min(from), last.1.max(to))
+                }
+                _ => dirty.push((from, to)),
+            }
         }
     }
 

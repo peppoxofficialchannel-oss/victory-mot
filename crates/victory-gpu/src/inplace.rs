@@ -515,6 +515,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 }
 
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
+#[allow(dead_code)] // Kept for tools and tests; `watch::protect` uses `aliases_in_range`.
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
         return Vec::new();
@@ -532,8 +533,107 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// For all title views overlapping `[start, end)` (64 KiB block-aligned),
+/// finds pages shown in `2..=MANY_VIEWS` views under a single lock hold.
+/// Returns `(aliased_source_blocks, all_aliased_blocks, peer_blocks_to_protect)`,
+/// with the block lists sorted and deduplicated.
+pub(crate) fn aliases_in_range(start: usize, end: usize) -> (u64, Vec<usize>, Vec<usize>) {
+    if start >= end {
+        return (0, Vec::new(), Vec::new());
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return (0, Vec::new(), Vec::new());
+    }
+    let mut sources = 0u64;
+    let mut all_aliased = Vec::new();
+    let mut peers = Vec::new();
+    let mut visit_view = |base: usize, bytes: usize, section: usize, offset: u64| {
+        let first_block = (base / K64).max(start / K64);
+        let last_block = base.saturating_add(bytes).div_ceil(K64).min(end.div_ceil(K64));
+        for block in first_block..last_block {
+            let page_addr = block * K64;
+            let within = page_addr.wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
+                continue;
+            };
+            if shown.len() < 2 || shown.len() > crate::watch::MANY_VIEWS {
+                continue;
+            }
+            sources += 1;
+            for &alias_addr in shown {
+                let alias_block = alias_addr / K64;
+                all_aliased.push(alias_block);
+                if alias_block != block {
+                    peers.push(alias_block);
+                }
+            }
+        }
+    };
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        visit_view(base, bytes, section, offset);
+    }
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        visit_view(base, bytes, section, offset);
+    }
+    all_aliased.sort_unstable();
+    all_aliased.dedup();
+    peers.sort_unstable();
+    peers.dedup();
+    (sources, all_aliased, peers)
+}
+
+/// All 64 KiB block indices showing the same physical pages as any block in
+/// `runs` (`(from_block, to_block)`), collected under a single lock hold,
+/// sorted and deduplicated.
+pub(crate) fn aliases_for_blocks(runs: &[(usize, usize)]) -> Vec<usize> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &(from, to) in runs {
+        let mut b = from;
+        let end_addr = to.saturating_mul(K64);
+        while b < to {
+            let addr = b.saturating_mul(K64);
+            if let Some((&base, &(bytes, section, offset))) = v.views.range(..=addr).next_back()
+                && addr < base.saturating_add(bytes)
+            {
+                let view_end = base.saturating_add(bytes).div_ceil(K64).min(to);
+                for blk in b..view_end {
+                    let within = blk.saturating_mul(K64).wrapping_sub(base);
+                    if within < bytes
+                        && within.is_multiple_of(K64)
+                        && let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                    {
+                        out.extend(shown.iter().map(|&a| a / K64));
+                    }
+                }
+                b = view_end;
+            } else if let Some((&next_base, _)) = v.views.range(addr.saturating_add(1)..end_addr).next() {
+                b = (next_base / K64).max(b + 1);
+            } else {
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
+#[allow(dead_code)] // Kept for tools and tests; `watch::open` uses `aliases_for_blocks`.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     let v = views();
     let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {

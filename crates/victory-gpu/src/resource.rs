@@ -2667,6 +2667,66 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(*found as This)
 }
 
+/// Whether `VICTORY_PLACED_LOG=1` asks for a line per texture the title
+/// places in memory and per description this host refuses (off, the
+/// default: one relaxed read per texture made, nothing else).
+#[cfg(windows)]
+fn placed_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_LOG").is_some_and(|v| v == "1"))
+}
+
+/// What became of a texture the title placed at `address`: made, or why
+/// not. Once per distinct description, and at most 300 of them.
+///
+/// Why this exists: a descriptor slot whose view the host cannot make reads
+/// the 1x1 fallback (`descriptor::host::null_like`), and the screen it fills
+/// says nothing about which texture is missing. A texture the title writes
+/// itself — a movie's planes, the memory a decoder fills — is made here, so
+/// the refusals are the whole of that question and there are few of them.
+#[cfg(windows)]
+fn say_placed(address: u64, d: &ResourceDesc, why: Option<&str>) {
+    type Key = (u32, u32, u32, u64, u32);
+    static SAID: std::sync::Mutex<Option<std::collections::BTreeSet<Key>>> =
+        std::sync::Mutex::new(None);
+    let key: Key = (d.dimension, d.format, d.layout, d.width, d.height);
+    let fresh = {
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        let set = said.get_or_insert_with(std::collections::BTreeSet::new);
+        set.len() < 300 && set.insert(key)
+    };
+    if !fresh {
+        return;
+    }
+    match why {
+        None => tracing::info!(
+            address = format_args!("{address:#x}"),
+            width = d.width,
+            height = d.height,
+            array = d.depth_or_array_size,
+            mips = d.mip_levels,
+            format = d.format,
+            layout = d.layout,
+            dimension = d.dimension,
+            flags = d.flags,
+            "a texture the title placed in memory, made here from that memory (VICTORY_PLACED_LOG)"
+        ),
+        Some(why) => tracing::warn!(
+            address = format_args!("{address:#x}"),
+            width = d.width,
+            height = d.height,
+            array = d.depth_or_array_size,
+            mips = d.mip_levels,
+            format = d.format,
+            layout = d.layout,
+            dimension = d.dimension,
+            flags = d.flags,
+            why,
+            "a texture the title placed in memory that this host cannot make: every slot that names it reads the null view (VICTORY_PLACED_LOG)"
+        ),
+    }
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -2710,6 +2770,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if d.dimension == BUFFER {
         return None;
     }
+    let log = placed_log();
+    if log && texture_layout(&d).is_none() {
+        say_placed(
+            address,
+            &d,
+            Some("its description names a dimension or a layout this host has no branch for"),
+        );
+    }
     let mut out = std::ptr::null();
     let made = create_at_address(
         std::ptr::null(),
@@ -2721,7 +2789,13 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         &mut out,
     );
     if made != S_OK {
+        if log {
+            say_placed(address, &d, Some("the host would not create it"));
+        }
         return None;
+    }
+    if log {
+        say_placed(address, &d, None);
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);

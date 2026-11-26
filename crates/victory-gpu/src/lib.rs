@@ -24,6 +24,8 @@ mod bvhtrace;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod card_mask;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

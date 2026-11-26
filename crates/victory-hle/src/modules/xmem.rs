@@ -346,17 +346,84 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section and, with `VICTORY_KEEP_PAGES`, the address of a view of all
+/// of it that holds its pages in our working set (0: none; see [`keep`]).
+struct Section(HANDLE, usize);
 
-// SAFETY: a section handle may be used from any thread.
+// SAFETY: a section handle and a view address may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if self.1 != 0 {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: the keeping view, ours alone.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.1 as *mut c_void,
+                })
+            };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// `VICTORY_KEEP_PAGES=1`: each section of physical pages gets a view of
+/// all of it that is never unmapped, and every page a view commits is
+/// read once through it. Without one, a page the title writes and then
+/// unmaps from its last view (it remaps all the time) leaves our working
+/// set dirty, goes to the modified list and is written to the pagefile,
+/// though the title still holds it and nothing needs the copy. Measured on
+/// a SATA SSD (RX 7600 XT, 48 GB, nowhere near short of memory): the
+/// modified list jumping from 0.4 to 2.2 GB in a second, 175 to 300 MB/s
+/// of pagefile writes, and the drive then busy 100% at 2 MB/s for a
+/// minute and more, while DirectStorage reads waited behind it. A page
+/// still shown by the keeping view stays in the working set instead (in a
+/// test, 256 MB written and unmapped: +256 MB on the modified list
+/// without it, +0 with it); it leaves only when Windows trims us. Costs
+/// address space only (the view commits nothing) and one read per 4 KiB
+/// at each mapping. Not under Wine, whose sections are sparse files.
+///
+/// From fxceless/victory-fork PR #1294 (head fdc940c8d5), GPL-3.0-or-later
+/// like this tree. Off by default: the fork's own test on 16 GB of RAM and
+/// an NVMe was neutral to slightly negative.
+fn keeping() -> bool {
+    static KEEP: LazyLock<bool> = LazyLock::new(|| {
+        !on_wine() && std::env::var("VICTORY_KEEP_PAGES").is_ok_and(|v| v.trim() == "1")
+    });
+    *KEEP
+}
+
+/// The keeping view of a new section of `size` bytes, or 0.
+fn keeping_view(handle: HANDLE, size: usize) -> usize {
+    if !keeping() {
+        return 0;
+    }
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    // SAFETY: a whole view of a section we own; reserved pages stay
+    // uncommitted until a view commits them.
+    let at = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, size) };
+    if at.Value.is_null() {
+        tracing::warn!(size, error = %std::io::Error::last_os_error(), "no keeping view for physical pages");
+    }
+    at.Value as usize
+}
+
+/// Reads the `n` pages from `slice` on once through their section's
+/// keeping view, which puts them in our working set there. They must be
+/// committed.
+fn keep(slice: &Slice, n: usize) {
+    let base = slice.section.1;
+    if base == 0 {
+        return;
+    }
+    let start = base + slice.index * PAGE;
+    for at in (start..start + n * PAGE).step_by(4096) {
+        // SAFETY: inside the keeping view, at a committed page.
+        unsafe { std::ptr::read_volatile(at as *const u8) };
     }
 }
 
@@ -448,7 +515,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, keeping_view(handle, size)));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -509,7 +576,11 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        if !commit(at.Value as usize, len) {
+            return None;
+        }
+        keep(slice, n);
+        Some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -902,6 +973,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    keep(&slice, len.div_ceil(PAGE));
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
