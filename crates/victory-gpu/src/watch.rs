@@ -33,6 +33,28 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+// From cool-fox (GPL-3.0, commit f4b48ad): the mask of a page's parts, and
+// cutting a refresh's runs to the parts written.
+/// The parts of a page.
+const PARTS: usize = PAGE / KERNEL_PAGE;
+/// All of them.
+const WHOLE: u16 = u16::MAX;
+
+/// Whether the parts of a page that the kernel names are kept, and a refresh
+/// copies those (`VICTORY_TAKE_PARTS=1`; absent or `0`: the 64 KiB page, as
+/// before).
+///
+/// The kernel says which 4 KiB pages were written, and a copy took the 64 KiB
+/// around each: a title writing 4 KiB in a 64 KiB page was copied sixteen
+/// times over. Our logs: 172.7 MB copied a frame for the bytes written
+/// (`faults = 634 x MB_copied - 11,354`, r = 0.904), 124-167 ms of a frame
+/// (long21, long22). The donor measured 114 MB copied for 29 MB written
+/// (session play-1125-0203, run cpu-2). What is checked is as before, a page.
+pub(crate) fn parts_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TAKE_PARTS").is_some_and(|v| v == "1"))
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -59,6 +81,10 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
+    /// the parts are known ([`parts_on`]); a page that is not here was
+    /// written whole, as far as anyone knows.
+    parts: BTreeMap<usize, [u64; PARTS]>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -75,11 +101,47 @@ struct Journal {
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    parts: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
 });
+
+impl Journal {
+    /// Page `page` was found written by asking `now`: the parts in `parts`
+    /// (a bit each). The asking that found it written before (0: none).
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let before = self.written.insert(page, now).unwrap_or(0);
+        if parts == WHOLE || !parts_on() {
+            self.parts.remove(&page);
+            return before;
+        }
+        let all = self.parts.entry(page).or_insert([before; PARTS]);
+        for (k, at) in all.iter_mut().enumerate() {
+            if parts >> k & 1 != 0 {
+                *at = now;
+            }
+        }
+        before
+    }
+
+    /// The parts of `page` written by an asking after `taken`.
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        match self.parts.get(&page) {
+            Some(all) => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
+            None => WHOLE,
+        }
+    }
+}
+
+/// Of the pages of a copy that were written after it took them (page number,
+/// the asking it took the page at): the parts to take again, a bit for each
+/// 4 KiB, in the same order.
+pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -275,7 +337,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        j.note(page, WHOLE, now);
     }
 }
 
@@ -298,10 +360,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.note(page, WHOLE, now);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            j.note(other, WHOLE, now);
         }
     }
     (before, now)
@@ -359,8 +421,9 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     }
     let now = j.ahead_asked;
     for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        let at = j.found[k];
+        let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+        j.note(page, part, now);
     }
     true
 }
@@ -453,9 +516,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    for k in 0..count {
+        let at = j.found[k];
+        let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+        j.note(page, part, now);
+    }
+    for page in guarded {
+        j.note(page, WHOLE, now);
     }
     Some((
         now,
@@ -1293,7 +1360,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
-fn install() {
+pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -1303,13 +1370,32 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A fault of one of our own copies (`crate::safecopy`), and where its
+        // failing exit is: asked first, so that a page that is not there
+        // fails the copy instead of reaching the crash reporter.
+        let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
+        let fail = move |exit: usize| {
+            // SAFETY: the context the system passes, to go on from.
+            let context = unsafe { (*info).ContextRecord };
+            // SAFETY: as above.
+            unsafe { (*context).Rip = exit as u64 };
+            EXCEPTION_CONTINUE_EXECUTION
+        };
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
-            return EXCEPTION_CONTINUE_SEARCH;
+            return match ours {
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
         }
         let at = r.ExceptionInformation[1];
+        // A WRITE of ours is opened and retried here, never sent to the
+        // failing exit: the copy is to put our bytes, and stopping it at the
+        // guard would leave the title's old bytes in place, silently (the
+        // decodings `shadow` warns of). Only a block the guards will not open
+        // goes to the exit.
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1334,7 +1420,7 @@ fn install() {
             let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
             tracing::error!(
                 "a write to {at:#x} faults and the guards let it die: block {block:#x} protected {} clean {} absent {} aliased {} viewed {}; \
-                 VirtualQuery {n}: state {:#x} protect {:#x} type {:#x} base {:#x} region {:#x}",
+                 VirtualQuery {n}: state {:#x} protect {:#x} type {:#x} base {:#x} region {:#x}; one of our copies: {ours:?}",
                 g.protected.contains(&block),
                 g.clean.contains(&block),
                 g.absent.contains(&block),
@@ -1346,7 +1432,10 @@ fn install() {
                 info.BaseAddress as usize,
                 info.RegionSize
             );
-            EXCEPTION_CONTINUE_SEARCH
+            match ours {
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            }
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();

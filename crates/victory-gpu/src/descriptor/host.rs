@@ -529,6 +529,14 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::due`]; on unless
+/// `VICTORY_FAIR_DUE=0`, which keeps the order before run 1246).
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -561,16 +569,29 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// the order to serve them, in turns ([`TextureQueue::due_with`]).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_with(frame, max, fair_due())
+    }
+
+    /// [`TextureQueue::due`], with `fair` saying whether the two kinds are
+    /// served in turns:
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in turns:
+    ///   slot order served the low slots of a backlog of 25,000-40,000
+    ///   while the textures of the shot on screen waited (run 52: 98% of
+    ///   the drawn pixels had no colour texture in the first 3D frames);
+    /// - the two kinds one after the other (`fair`; `VICTORY_FAIR_DUE=0`:
+    ///   all those looked at before first, exactly as before). With them
+    ///   all first, a backlog of thousands of slots streaming in a part at
+    ///   a time filled every pass in the opening cutscene, which the
+    ///   pass's time then cut, and slots never looked at waited 300 to
+    ///   1,500 frames: faces whose textures are picked by index read an
+    ///   empty slot (black) or an older view (red, noise). In turns, a
+    ///   pass of `max` reaches `max/2` of each kind.
+    fn due_with(&self, frame: u64, max: usize, fair: bool) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -581,15 +602,32 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        if !fair {
+            let mut order: Vec<(u32, u64)> = again_order.collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order
@@ -3370,6 +3408,40 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// The queue serves the slots looked at before and the slots never
+    /// looked at in turns, one looked at before first (fxceless run 1246):
+    /// a pass that can take only part of a backlog streaming in a part at
+    /// a time still reaches the slots never looked at, the ones the shot
+    /// on screen wants. `VICTORY_FAIR_DUE=0` keeps the order before it:
+    /// every slot looked at before, ahead of every fresh one.
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        // Slots 100..110 looked at before: their memory was not mapped.
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due(u64::MAX, 100).iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        // Slots 1, 2 and 3 never looked at: the textures of the shot on screen.
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        // As before: a pass of 6 takes none of the fresh ones.
+        let old: Vec<u32> = q.due_with(10, 6, false).into_iter().map(|d| d.0).collect();
+        assert_eq!(old, [109, 108, 107, 106, 105, 104], "VICTORY_FAIR_DUE=0 keeps the order before run 1246");
+        // In turns: one looked at before comes first, and all three fresh
+        // ones are reached within the pass. The fresh ones are served newest
+        // first and oldest next (`due_with`, lines 582-585): 3, then 1, then
+        // 2 — otherwise a backlog of thousands would starve the oldest.
+        let order: Vec<u32> = q.due(10, 6).into_iter().map(|d| d.0).collect();
+        assert_eq!(order, [109, 3, 108, 1, 107, 2]);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
     }
 
     /// Slots held back for lack of room on the card are not handed out

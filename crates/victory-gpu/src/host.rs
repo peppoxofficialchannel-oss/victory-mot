@@ -81,6 +81,12 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions begun and finished, for those that need both ([`crate::pool`]'s
+/// blocks made ahead).
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(std::sync::atomic::Ordering::Acquire), FINISHED.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -7798,6 +7804,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let nt = nt_write_virtual_memory();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if crate::safecopy::on() {
+            // SAFETY: the source is our mapped host copy; a destination page
+            // that is not there, or not writable, fails the copy instead of
+            // faulting (the handler in `crate::watch` opens the guards).
+            return unsafe { crate::safecopy::copy(at as *mut u8, from, n) };
+        }
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination and writes nothing it cannot (the caller opened its
@@ -8075,6 +8087,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::safecopy::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }
@@ -8164,6 +8177,10 @@ impl Meter {
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
+                let [passes, nothing, all_looked, full, time, bytes, gone] =
+                    [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_PASSES[i].load(Ordering::Relaxed));
+                let [handed, looked, most] =
+                    [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURE_SLOTS[i].load(Ordering::Relaxed));
                 tracing::info!(
                     "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
                      {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
@@ -8171,7 +8188,10 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; {passes} passes over it ({nothing} with nothing due, {all_looked} \
+                     with every due slot looked at, {full} with the card without room, {time} on the pass's time, {bytes} on its \
+                     bytes, {gone} when the host device went), handed {handed} slots and looked at {looked} ({:.1} a pass, {most} \
+                     at most)",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -8179,7 +8199,8 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    looked as f64 / passes.max(1) as f64
                 );
             }
             {

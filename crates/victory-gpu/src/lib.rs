@@ -55,6 +55,10 @@ pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
+mod safecopy;
+#[cfg(windows)]
+mod pool;
+#[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
@@ -63,6 +67,8 @@ pub mod queue;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
+#[cfg(windows)]
+mod residency;
 pub mod root;
 #[cfg(windows)]
 mod census;

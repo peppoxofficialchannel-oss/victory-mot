@@ -1444,7 +1444,10 @@ pub(crate) fn room() -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
+                < budget / 100 * room_percent()
                 || spill_room()
         }
         None => filled < WITHOUT_BUDGET,
@@ -1539,6 +1542,9 @@ pub(crate) fn room_lately() -> bool {
     if last >> 1 == tenth {
         return last & 1 != 0;
     }
+    // (The pool is told, once a tenth of a second, how many empty blocks it
+    // may keep: [`crate::pool::room`].)
+    crate::pool::room(crate::host::host().and_then(|h| h.video_memory()));
     let room = room();
     LAST.store((tenth << 1) | u64::from(room), Relaxed);
     room
@@ -2160,6 +2166,34 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // A texture the title fills, whose every subresource the upload writes
+    // before anything reads it: cut from a block of 64 MiB (`crate::pool`),
+    // which makes it in about 6 microseconds instead of the 310 an
+    // allocation of its own takes; what the piece held before shows in no
+    // texel, since the upload covers it whole. `VICTORY_TEXTURE_POOL=1`
+    // (off by default: with the switch off every host texture is an
+    // allocation of its own, as before).
+    if !reserved
+        && clear.is_null()
+        && fills(desc)
+        && d.sample_count <= 1
+        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+        // SAFETY: the description has the host layout (checked size, same
+        // fields), as for `CreateCommittedResource` below.
+        && let Some(t) = unsafe {
+            crate::pool::texture(
+                &host.device,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+            )
+        }
+    {
+        crate::census::made(4, 0);
+        crate::host::name(&t, || {
+            format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
+        });
+        return Some(t);
+    }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture

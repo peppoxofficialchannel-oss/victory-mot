@@ -428,6 +428,16 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Passes over the textures picked by index and why each stopped, since the
+/// start ([`State::heap_textures`], for the queue line): in all; with
+/// nothing due; with every due slot looked at; when the card had no room
+/// for a new host copy; on the pass's time; on its bytes; and when the host
+/// device went.
+pub(crate) static HEAP_TEXTURE_PASSES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Slots handed to those passes by the queue since the start; slots they
+/// then looked at (the loop stops early on the time or the bytes); and the
+/// most one pass looked at.
+pub(crate) static HEAP_TEXTURE_SLOTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -445,7 +455,7 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 /// back the slots that need a new host copy (`VICTORY_FULL_CARD_PASS=0`:
 /// no, as before: they stay due, each pass looks at the same ones again
 /// and stops at the 257th). Held back, such a slot is looked at again
-/// after about four seconds or as soon as the card has room, and the pass
+/// after `VICTORY_RELOOK_MS` (20 s) or as soon as the card has room, and the pass
 /// goes on to the slots behind it: the ones whose host copy exists and
 /// only wants bringing up to date, and the ones whose memory went (letting
 /// their host copies go is what makes room). What is uploaded while the
@@ -468,6 +478,30 @@ fn reupload_when_full() -> bool {
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_TEXTURE_SLOW_LOOK`'s reading: the frames between the looks at
+/// a texture picked by index whose normal rechecks ([`RECHECK_FRAMES`]) are
+/// over, or none. Only a positive whole number of frames counts; absent,
+/// empty, 0, negative or not a number: none ([`texture_slow_look`]).
+fn slow_look_frames(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse::<u64>().ok().filter(|&frames| frames != 0)
+}
+
+/// Frames between the looks at a texture picked by index after its normal
+/// rechecks ([`RECHECK_FRAMES`]) are over (`VICTORY_TEXTURE_SLOW_LOOK=0` or
+/// unset: no such look, exactly as before). A title may fill a texture's
+/// memory after the host copy was uploaded, with no descriptor write and
+/// nothing from the runtime to tell of it; the host copy then kept what the
+/// memory held at the first look for the rest of the run. The slow look
+/// reads the same fingerprint (48 KiB) and uploads only a texture that
+/// changed, so an unchanged one costs the read and no upload. On, every
+/// slot stays in the queue of textures picked by index for good, looked at
+/// once per period: the pass's budget is shared with them (in turns with
+/// the slots never looked at, unless `VICTORY_FAIR_DUE=0`).
+fn texture_slow_look() -> Option<u64> {
+    static ON: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| slow_look_frames(std::env::var("VICTORY_TEXTURE_SLOW_LOOK").ok().as_deref()))
 }
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
@@ -1804,10 +1838,11 @@ impl State {
     /// draws read through tables are not in the queue.
     /// shortcut: uploaded once, and again only when the title rewrites the
     /// slot. A placed texture not all mapped yet is uploaded with what is
-    /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
-    /// in place of others, and contents changed with no descriptor write,
-    /// are missed (hook the page-mapping events for those).
+    /// there and looked at again (1, 2, 4, ... frames later, at most
+    /// `VICTORY_RELOOK_MS`, 20 s): uploaded again when more of it is
+    /// mapped. Pages mapped in place of others, and contents changed with
+    /// no descriptor write, are missed (hook the page-mapping events for
+    /// those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
     fn heap_textures(
         &self,
@@ -1875,16 +1910,25 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // The frames in about `VICTORY_RELOOK_MS` (20,000 unless said;
+        // 4,000 before), between 16 and 1,024: how long a slot with nothing
+        // to upload waits at most for its next look. In frames alone it was
+        // 120: four minutes at the opening cutscene's half a frame per
+        // second, while the title streams by the clock. At 4,000 the
+        // opening cutscene's 4 frames a second looked at its ~20,000 slots
+        // waiting for their memory every 16 frames, thousands of queries a
+        // second and most of the pass's time, while slots never looked at
+        // waited. The runtime's mappings already make a slot due
+        // (`texture_slots_remapped`); these looks are only for what that
+        // does not tell.
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        static RELOOK_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let relook = *RELOOK_MS.get_or_init(|| {
+            std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20_000)
+        });
+        let most = (relook / took).clamp(16, 1024);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1920,10 +1964,22 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let handed = due.len() as u64;
+        // Why the pass stops, for [`HEAP_TEXTURE_PASSES`]: 2, every due slot
+        // looked at (the queue may still have had more than 4,096 due); 1,
+        // nothing was due at all.
+        let mut stop = if handed == 0 { 1 } else { 2 };
+        let mut looked = 0u64;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most {
+                stop = 5;
                 break;
             }
+            if began.elapsed() > span {
+                stop = 4;
+                break;
+            }
+            looked += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -1942,6 +1998,9 @@ impl State {
             // it. The host copy then kept what the memory held at the
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
+            // `VICTORY_TEXTURE_SLOW_LOOK=<frames>`: such a look every that
+            // many frames after those few, for the rest of the run; off,
+            // the slot is done after them, as before.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
@@ -1950,7 +2009,16 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // `VICTORY_TEXTURE_SLOW_LOOK`: after the few normal
+                        // looks, one every that many frames, for good (the
+                        // look count stays where it is, so this arm runs
+                        // again each time); off, done as before.
+                        None => match texture_slow_look() {
+                            Some(every) => {
+                                host.texture_slot_recheck(index, write, frame.saturating_add(every), (at, len), print, looks, uploaded)
+                            }
+                            None => host.texture_slot_done(index, write, None),
+                        },
                     }
                     continue;
                 }
@@ -2021,14 +2089,16 @@ impl State {
                 if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
-                        // Held back for the frames of about four seconds
-                        // (`most`), or until the card has room; the pass
-                        // goes on, within a count that bounds one pass.
+                        // Held back for `most` frames (about 20 s), or
+                        // until the card has room; the pass goes on, within
+                        // a count that bounds one pass.
                         host.texture_slot_held(index, write, frame + most);
                         if refused > 1024 {
+                            stop = 3;
                             break;
                         }
                     } else if refused > 256 {
+                        stop = 3;
                         break;
                     }
                     continue;
@@ -2073,7 +2143,8 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                stop = 6;
+                break;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2123,6 +2194,13 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        {
+            HEAP_TEXTURE_PASSES[0].fetch_add(1, Ordering::Relaxed);
+            HEAP_TEXTURE_PASSES[stop as usize].fetch_add(1, Ordering::Relaxed);
+            HEAP_TEXTURE_SLOTS[0].fetch_add(handed, Ordering::Relaxed);
+            HEAP_TEXTURE_SLOTS[1].fetch_add(looked, Ordering::Relaxed);
+            HEAP_TEXTURE_SLOTS[2].fetch_max(looked, Ordering::Relaxed);
         }
     }
 
@@ -4085,5 +4163,24 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `VICTORY_TEXTURE_SLOW_LOOK` reads as a positive whole number of
+    /// frames, and off for anything else (absent, empty, 0, negative, not a
+    /// number, infinite).
+    #[test]
+    fn the_slow_look_reads_a_positive_number_of_frames() {
+        assert_eq!(slow_look_frames(Some("120")), Some(120));
+        assert_eq!(slow_look_frames(Some(" 40 ")), Some(40));
+        assert_eq!(slow_look_frames(Some("1")), Some(1));
+        for off in [None, Some(""), Some("   "), Some("0"), Some("-4"), Some("abc"), Some("inf"), Some("NaN")]
+        {
+            assert_eq!(slow_look_frames(off), None, "{off:?}");
+        }
     }
 }
