@@ -4306,6 +4306,14 @@ static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::ne
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Since the last frame line: bytes of the copies made, microseconds spent
+/// making them, microseconds spent walking the kept ones (the `retain`), and
+/// kept entries that walk visited.
+static EXACT_BYTES: AtomicU64 = AtomicU64::new(0);
+static EXACT_CREATE_US: AtomicU64 = AtomicU64::new(0);
+static EXACT_SWEEP_US: AtomicU64 = AtomicU64::new(0);
+static EXACT_WALKED: AtomicU64 = AtomicU64::new(0);
+
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
 /// element of the copy its buffer has (`descriptor/host.rs` `own_bytes`).
@@ -4343,15 +4351,24 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
+        let sweep = std::time::Instant::now();
         map.retain(|_, (shadow, used)| {
+            EXACT_WALKED.fetch_add(1, Ordering::Relaxed);
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        EXACT_SWEEP_US.fetch_add(sweep.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // The copy's bytes are the buffer's, rounded up like its size.
+    let bytes = len.next_multiple_of(256);
+    let owner = host()?;
+    let made = std::time::Instant::now();
+    let (buffer, data) = owner.shared_buffer(bytes)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    EXACT_CREATE_US.fetch_add(made.elapsed().as_micros() as u64, Ordering::Relaxed);
+    EXACT_BYTES.fetch_add(bytes, Ordering::Relaxed);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -4365,12 +4382,24 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
+    let [bytes, create_us, sweep_us, walked] = [
+        EXACT_BYTES.swap(0, Ordering::Relaxed),
+        EXACT_CREATE_US.swap(0, Ordering::Relaxed),
+        EXACT_SWEEP_US.swap(0, Ordering::Relaxed),
+        EXACT_WALKED.swap(0, Ordering::Relaxed),
+    ];
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept, \
+         their own bytes: {:.1} copies, {:.1} MB, {:.1}+{:.1} us, {:.0} kept entries walked",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        made as f64 / frames,
+        bytes as f64 / 1e6 / frames,
+        create_us as f64 / frames,
+        sweep_us as f64 / frames,
+        walked as f64 / frames
     );
 }
 
