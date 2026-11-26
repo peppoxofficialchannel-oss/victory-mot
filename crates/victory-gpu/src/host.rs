@@ -8391,14 +8391,14 @@ impl Meter {
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
         // dispatch runs; the counter went when the clamp's budget moved to
         // the card's memory.)
-        {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
-            tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
-                texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
-            );
-        }
+        // Read and cleared in one place ([`crate::draw::take_heap_pass_parts`]),
+        // so this line and the pass line below count the same window.
+        let [texture_us, slots] = crate::draw::take_heap_pass_parts();
+        tracing::info!(
+            "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+            texture_us as f64 / 1e3 / frames,
+            slots as f64 / frames
+        );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
@@ -8406,7 +8406,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::safecopy::line(frames);
-        crate::draw::heap_pass_line();
+        crate::draw::heap_pass_line(frames, slots);
         if let Some(host) = host() {
             host.drain_messages();
         }

@@ -477,17 +477,30 @@ impl HeapTiming {
 static HEAP_PHASE_MICROS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static HEAP_FULL_SCANS: AtomicU64 = AtomicU64::new(0);
 
-/// The pass over the heap broken down by phase since the last call, one line
-/// (`VICTORY_HEAP_TIMINGS=1`; nothing when it is off).
-pub(crate) fn heap_pass_line() {
+/// The pass's two parts ([`HEAP_PASS_PARTS`]) since the last frame line, read
+/// and cleared: the microseconds of its pass over textures picked by index
+/// and the buffer slots its pass over buffer views looked at. Read here and
+/// nowhere else, so the frame line's meter and [`heap_pass_line`] count the
+/// same window.
+pub(crate) fn take_heap_pass_parts() -> [u64; 2] {
+    [0, 1].map(|i| HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed))
+}
+
+/// The pass over the heap broken down by phase since the last call, one line,
+/// with the microseconds a frame of each phase and the buffer slots looked at
+/// a frame (`frames` is the frame line's count, `slots` its read of
+/// [`HEAP_PASS_PARTS`]'s slot count, so the two lines divide the same window;
+/// `VICTORY_HEAP_TIMINGS=1`; nothing when it is off).
+pub(crate) fn heap_pass_line(frames: f64, slots: u64) {
     if !HeapTiming::enabled() {
         return;
     }
     let [slots_us, spans_us, refresh_wait_us, refresh_record_us, texture_queue_us] =
-        HEAP_PHASE_MICROS.each_ref().map(|count| count.swap(0, Ordering::Relaxed));
+        HEAP_PHASE_MICROS.each_ref().map(|count| count.swap(0, Ordering::Relaxed) as f64 / frames);
+    let slots = slots as f64 / frames;
     let full = if HEAP_FULL_SCANS.swap(0, Ordering::Relaxed) > 0 { " full scan" } else { "" };
     tracing::info!(
-        "heap buffer pass: {slots_us} slots, {spans_us} spans, {refresh_wait_us}+{refresh_record_us} refresh, {texture_queue_us} texture queue us{full}"
+        "heap buffer pass: {slots_us:.1} slots, {spans_us:.1} spans, {refresh_wait_us:.1}+{refresh_record_us:.1} refresh, {texture_queue_us:.1} texture queue us over {slots:.1} slots{full}"
     );
 }
 
