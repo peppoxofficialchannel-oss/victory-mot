@@ -1915,6 +1915,73 @@ mod merge_tests {
         assert_eq!(scratch.len(), PIECE);
     }
 
+    /// One `copy_back` of a range as `copy_back_with` does it: `back_piece`
+    /// over the copy's bytes, then the runs put into title memory. `old` is
+    /// the range's snapshot bytes, which `copy_back_with` never updates.
+    fn put_back(host: &mut [u8], old: &[u8], title_memory: &mut [u8]) {
+        let (mut scratch, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        let read = |first: usize, into: &mut [u8]| {
+            into.copy_from_slice(&title_memory[first..first + into.len()]);
+            true
+        };
+        let Some((first, _)) = back_piece(host, old, &mut scratch, &mut mask, &mut runs, read) else {
+            return;
+        };
+        for &(off, len) in &runs {
+            title_memory[first + off..first + off + len].copy_from_slice(&scratch[off..off + len]);
+        }
+    }
+
+    /// Upstream VIctory #3031, at our granularity: one submission declares
+    /// two overlapping ranges, one of them partial (well under [`PIECE`], so
+    /// no 64 KiB dedup could hide the second compare), and the title writes
+    /// a byte in the overlap between the two `copy_back`s. The second puts
+    /// back the copy's bytes that differ from the snapshot, which includes
+    /// that byte; it must keep the title's newer byte, not the copy's older
+    /// one, because the title's byte is no longer the snapshot's.
+    #[test]
+    fn a_title_write_between_two_overlapping_put_backs_stays() {
+        const PAGE: usize = 0x1000;
+        let old: Vec<u8> = (0..2 * PAGE).map(|i| (i * 7 + i / 251) as u8).collect();
+        // The GPU's byte at a place the snapshot has another (as a shader's
+        // store); the title had its own copy of the bytes throughout.
+        let gpu = |at: usize| old[at] ^ 0x33;
+
+        // [0, PAGE) went back first, then [0, 2 * PAGE): the first range is
+        // part of the second, and both are under PIECE.
+        let mut host = old.clone();
+        let mut title_memory = old.clone();
+        host[0x800] = gpu(0x800);
+        host[0x1800] = gpu(0x1800);
+        put_back(&mut host[..PAGE], &old[..PAGE], &mut title_memory[..PAGE]);
+        assert_eq!(title_memory[0x800], gpu(0x800), "the GPU's byte went back");
+        // The title writes its own newer byte in the overlap, and one on a
+        // byte the GPU did not write, between the two copy-backs.
+        let title_wrote = old[0x800] ^ 0x11;
+        title_memory[0x800] = title_wrote;
+        let title_only = old[0x900] ^ 0x77;
+        title_memory[0x900] = title_only;
+        put_back(&mut host[..2 * PAGE], &old[..2 * PAGE], &mut title_memory[..2 * PAGE]);
+        assert_eq!(title_memory[0x800], title_wrote, "the title's newer write stays");
+        assert_eq!(host[0x800], title_wrote, "and the copy takes it, not the old byte");
+        assert_eq!(title_memory[0x900], title_only, "a title byte the GPU left alone stays");
+        assert_eq!(title_memory[0x1800], gpu(0x1800), "the GPU's byte goes back");
+
+        // The other way round: the partial range first, then one that
+        // starts before it and covers part of it ([0, 0x1800)).
+        let mut host = old.clone();
+        let mut title_memory = old.clone();
+        host[0x1200] = gpu(0x1200);
+        host[0x0800] = gpu(0x0800);
+        put_back(&mut host[PAGE..], &old[PAGE..], &mut title_memory[PAGE..]);
+        assert_eq!(title_memory[0x1200], gpu(0x1200));
+        let title_wrote = old[0x1200] ^ 0x55;
+        title_memory[0x1200] = title_wrote;
+        put_back(&mut host[..0x1800], &old[..0x1800], &mut title_memory[..0x1800]);
+        assert_eq!(title_memory[0x1200], title_wrote, "the title's newer write stays");
+        assert_eq!(title_memory[0x0800], gpu(0x0800), "the GPU's byte goes back");
+    }
+
     /// The merge eight bytes at a time is the same merge as byte by byte:
     /// the title's byte where the copy's is what it was before the
     /// submission, the copy's where it moved and the title left its own,
