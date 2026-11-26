@@ -884,7 +884,8 @@ fn uncommitted_end(block: usize) -> usize {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded. The same physical pages at
+/// notes them written; true if any was guarded and given write access (a
+/// block that could not be stays in the guards). The same physical pages at
 /// every other view of them are opened too: the write that faulted (or is
 /// ours, `crate::host::copy_mapped`) goes through one view, and every
 /// guard over the pages must copy them again.
@@ -907,7 +908,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     any
 }
 
-/// [`open`] for one range, without the other views of its pages.
+/// [`open`] for one range, without the other views of its pages. True if a
+/// block of the range was guarded and given write access: a block still
+/// read-only is not counted, and stays in the guards for the next fault.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
@@ -915,14 +918,28 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    let mut opened = false;
     for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        if done == 0 {
+            // Left in the guards (still `protected`, still read-only) so the
+            // next write there faults into `on_write`, is looked at again and
+            // says so: dropping the block here left it read-only and unknown
+            // to every set, and the next write to it was let through to die.
+            tracing::error!(
+                "a guarded block of title memory could not be given write access: {:#x} (block {block:#x}): {}",
+                block * BLOCK,
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+        opened = true;
     }
-    !blocks.is_empty()
+    opened
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -1159,6 +1176,29 @@ fn install() {
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
+            // The run dies here. One line, only on this path: what the
+            // guards make of the fault and what Windows says of the page,
+            // so that the next one is a proof rather than a signature.
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+            let block = at / BLOCK;
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            tracing::error!(
+                "a write to {at:#x} faults and the guards let it die: block {block:#x} protected {} clean {} absent {} aliased {} viewed {}; \
+                 VirtualQuery {n}: state {:#x} protect {:#x} type {:#x} base {:#x} region {:#x}",
+                g.protected.contains(&block),
+                g.clean.contains(&block),
+                g.absent.contains(&block),
+                g.aliased.contains(&block),
+                g.viewed.contains(&block),
+                info.State,
+                info.Protect,
+                info.Type,
+                info.BaseAddress as usize,
+                info.RegionSize
+            );
             EXCEPTION_CONTINUE_SEARCH
         }
     }
