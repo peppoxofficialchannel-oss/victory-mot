@@ -43,7 +43,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use super::{CONSTANT, KIND_SHIFT, PLACED, VIEW_TAG, View, view_at, views_read};
+use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -2272,61 +2272,6 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
-    }
-
-    /// Whether the view the record at `handle` names is still there, without
-    /// the view itself: [`view_at`]'s test, which `mirror` makes to tell a
-    /// resource the title released under it (the record stays as it was, the
-    /// table entry's generation moves on), without its clone. A `View` is 128
-    /// bytes and every slot of a full pass of the heap's buffer views asks
-    /// this.
-    fn view_alive(i: u32, generation: u32) -> bool {
-        match generation >> KIND_SHIFT {
-            0 => {
-                let views = views_read();
-                views
-                    .list
-                    .get(i as usize)
-                    .is_some_and(|&(_, current)| current == generation)
-            }
-            // A constant buffer view is its record's own words, and a placed
-            // view is found by the shape its record numbers.
-            CONSTANT => true,
-            PLACED => views_read().placed_of(i, generation).is_some(),
-            _ => false,
-        }
-    }
-
-    /// Whether host slot `index` still shows what the title's record at
-    /// `handle` names: the record's view is the one the slot was made from,
-    /// and it is still there (`view_at` finds one).
-    ///
-    /// [`HostHeap::mirror`] would make nothing and find the same host copy
-    /// ([`buffer_copy`]) for such a slot, so the pass over the heap's buffer
-    /// views skips it and keeps its entry, which holds that copy alive. A
-    /// view released under the title fails this (the record is as it was, the
-    /// generation is not) and its slot is looked at again: the pass's every
-    /// sixteenth walk over every buffer slot is what keeps such a slot from
-    /// showing a copy of memory the title has taken back.
-    ///
-    /// Reads the record as [`HostHeap::mirror`] does, and nothing else: no
-    /// clone of the view, no `make`, no `buffer_copy`, no `note_buffer`.
-    pub(crate) fn still_made(&self, index: u32, handle: u64) -> bool {
-        if index >= self.count {
-            return false;
-        }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        if tag != VIEW_TAG || !Self::view_alive(i, generation) {
-            return false;
-        }
-        // As `mirror`: a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
-        self.made
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)
-            .is_some_and(|&made| made == key)
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).

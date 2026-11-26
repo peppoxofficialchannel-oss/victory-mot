@@ -751,23 +751,6 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
-/// Whether the pass over the heap's buffer views skips title slot `index`:
-/// its record still names the view its host slot was made from, and that view
-/// is still there ([`HostHeap::still_made`]: a view released under the title
-/// fails it, though its record is as it was), and the pass keeps an entry for
-/// the slot, which holds the host copy it reads alive. `mirror` and
-/// `buffer_copy` would find the same view and the same copy for it.
-///
-/// [`HostHeap::still_made`]: crate::descriptor::host::HostHeap::still_made
-fn slot_unchanged(
-    host: &crate::descriptor::host::HostHeap,
-    index: u32,
-    handle: u64,
-    kept: bool,
-) -> bool {
-    kept && host.still_made(index, handle)
-}
-
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -1749,10 +1732,7 @@ impl State {
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then. A slot whose
-        // record still names the view it was made from, and that view is
-        // still there ([`HostHeap::still_made`]), is skipped on any pass: its
-        // entry stays, and the entry is what holds the copy it reads alive.
+        // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
@@ -1766,16 +1746,8 @@ impl State {
         let mut timing = HeapTiming::enabled().then(|| HeapTiming::new(std::time::Instant::now(), full));
         let changed = host.buffer_changes();
         let slots = if full {
-            // Every 16 passes every buffer slot is asked after: a view the
-            // title released leaves its record as it was, and only the table
-            // says (`still_made`). The entries of slots that are no longer
-            // buffer views go before the walk (`note_buffer` takes such a
-            // slot out of `buffers` into `changed` when it is written, so
-            // this sweeps what a write it never saw left).
-            let slots = host.buffer_slots();
-            let held: std::collections::HashSet<u32> = slots.iter().copied().collect();
-            ranges.retain(|index, _| held.contains(index));
-            slots
+            ranges.clear();
+            host.buffer_slots()
         } else {
             changed
         };
@@ -1786,8 +1758,14 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            // Every 64 views while the device lives (a cheap query), whether
-            // or not the slots between were skipped.
+            ranges.remove(&index);
+            let Some(handle) = heap.handle(index) else {
+                continue;
+            };
+            let Some(view) = host.mirror(index, handle, true) else {
+                continue;
+            };
+            // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
                 && let Some(why) = crate::descriptor::host::device_removed()
@@ -1802,23 +1780,6 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            let Some(handle) = heap.handle(index) else {
-                ranges.remove(&index);
-                continue;
-            };
-            // Nothing written and nothing released: the record names the view
-            // the slot was made from and the entry kept for it holds the copy
-            // it reads. `mirror` would not call `note_buffer` for such a slot
-            // either (it does only for a new key, or a view that is gone), so
-            // skipping it leaves that as it was, and the entry stays: it is
-            // what keeps the copy alive and refreshed.
-            if slot_unchanged(host, index, handle, ranges.contains_key(&index)) {
-                continue;
-            }
-            ranges.remove(&index);
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
@@ -4451,111 +4412,6 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A slot for the heap pass to look at: a host heap with a title slot, a
-    /// title buffer of 64 KiB registered with the copy the pass makes of it,
-    /// and a placed view of that buffer, its record written where the title's
-    /// descriptor would be. `None` without a host device.
-    ///
-    /// The view is a table entry (its address is past the 1 TiB placed views
-    /// are kept below, so its record is not the view whole), and names no
-    /// resource object: the pass's own `note_buffer` is what makes the slot a
-    /// buffer's, and a release is `descriptor::release_view`.
-    const SLOT: u32 = 3;
-    const TITLE: u64 = 0x100_0000_0000;
-    const BYTES: u64 = 64 << 10;
-
-    fn slot_ready() -> Option<(crate::descriptor::host::HostHeap, View, Box<[u32; 3]>, u64)> {
-        let heap = crate::descriptor::host::HostHeap::new(false, 8)?;
-        crate::shadow::register(0x53_10, TITLE, BYTES);
-        let mut desc = [0u32; 16];
-        desc[1] = 1; // a buffer view
-        desc[2] = 5768; // the default component mapping
-        desc[6] = (BYTES / 4) as u32; // elements of four bytes
-        desc[7] = 4; // bytes of an element
-        desc[10] = TITLE as u32;
-        desc[11] = (TITLE >> 32) as u32;
-        let mut resource = [0u32; 14];
-        resource[0] = 1; // a buffer, not a texture
-        resource[4] = BYTES as u32;
-        resource[5] = (BYTES >> 32) as u32;
-        let view = View::Placed(false, resource, desc);
-        // The record the title's device method would leave at the slot.
-        let mut record: Box<[u32; 3]> = Box::new([0; 3]);
-        let handle = record.as_mut_ptr() as u64;
-        crate::descriptor::record_view(handle, view.clone());
-        Some((heap, view, record, handle))
-    }
-
-    /// The pass skips a slot whose record still names the view it was made
-    /// from: the entry kept for it holds the copy, which `Arc::strong_count`
-    /// and the host resource's own references both show (the slot's made
-    /// descriptor is one of them).
-    #[test]
-    fn a_slot_with_its_view_unchanged_keeps_the_copy_it_reads() {
-        let Some((heap, view, _record, handle)) = slot_ready() else {
-            return;
-        };
-        let Some(_) = heap.mirror(SLOT, handle, true) else {
-            return;
-        };
-        let Some((copy, from, to)) = crate::descriptor::host::buffer_copy(&view) else {
-            return;
-        };
-        let mut ranges: std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        ranges.insert(SLOT, (copy.clone(), from, to));
-        let held = std::sync::Arc::strong_count(&copy);
-        // The pass again, the record as it was.
-        assert!(slot_unchanged(&heap, SLOT, handle, ranges.contains_key(&SLOT)));
-        assert_eq!(std::sync::Arc::strong_count(&copy), held);
-        assert!(crate::host::references(&copy.buffer) > 1);
-    }
-
-    /// (b) A skipped slot stays a buffer's (`buffers`), which is what keeps
-    /// its copy among the spans the pass brings up to date every frame.
-    #[test]
-    fn a_slot_skipped_as_unchanged_stays_one_the_pass_refreshes() {
-        let Some((heap, _view, _record, handle)) = slot_ready() else {
-            return;
-        };
-        let Some(_) = heap.mirror(SLOT, handle, true) else {
-            return;
-        };
-        assert!(heap.buffer_slots().contains(&SLOT), "the slot is a buffer's");
-        // The pass again, the record as it was: skipped, so nothing is
-        // written that could take the slot out of `buffers`.
-        assert!(slot_unchanged(&heap, SLOT, handle, true));
-        assert!(heap.buffer_slots().contains(&SLOT));
-    }
-
-    /// A view released under the title leaves its record exactly as it was:
-    /// the pass does not skip the slot, makes it null, and the slot stops
-    /// being a buffer's, so nothing goes on refreshing what it held.
-    #[test]
-    fn a_released_view_fails_the_skip_and_its_slot_lets_the_copy_go() {
-        let Some((heap, view, _record, handle)) = slot_ready() else {
-            return;
-        };
-        let Some(_) = heap.mirror(SLOT, handle, true) else {
-            return;
-        };
-        let Some((copy, from, to)) = crate::descriptor::host::buffer_copy(&view) else {
-            return;
-        };
-        let mut ranges: std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        ranges.insert(SLOT, (copy, from, to));
-        // The title gives the buffer back, as `Resource::release` tells it.
-        crate::descriptor::release_view(&view);
-        assert!(!slot_unchanged(&heap, SLOT, handle, ranges.contains_key(&SLOT)));
-        // The pass's turn over the slot, as `heap_buffers` makes it.
-        ranges.remove(&SLOT);
-        assert!(heap.mirror(SLOT, handle, true).is_none());
-        assert!(!heap.made(SLOT));
-        assert!(!heap.buffer_slots().contains(&SLOT));
-        assert!(ranges.is_empty());
-    }
 
     /// `VICTORY_TEXTURE_SLOW_LOOK` reads as a positive whole number of
     /// frames, and off for anything else (absent, empty, 0, negative, not a

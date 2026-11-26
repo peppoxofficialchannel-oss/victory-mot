@@ -869,13 +869,6 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
-/// For the tests: writes the record of `view` at `handle`, as a device method
-/// of the title's does ([`record`]).
-#[cfg(test)]
-pub(crate) fn record_view(handle: u64, view: View) {
-    record(handle, view);
-}
-
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -901,22 +894,6 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
-}
-
-/// For the tests: releases the table entry of `view` as [`forget`] releases
-/// one whose resource the title gave back (its generation moves on, so the
-/// records that name it find nothing, and the entry is free for another
-/// view), for a view that names no resource object (a placed buffer's).
-#[cfg(test)]
-pub(crate) fn release_view(view: &View) {
-    let mut views = views_write();
-    let Some(&i) = views.index.get(view) else {
-        return;
-    };
-    let generation = views.list[i as usize].1;
-    views.index.remove(view);
-    views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
-    views.free.push(i);
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
