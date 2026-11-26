@@ -44,12 +44,14 @@
 //! How: the image cannot be read and written in the same draw (the read
 //! would be undefined), and D3D12 copies neither into nor from a resource
 //! bound as a target (the exposure pass found this first, commit 59d073a1).
-//! So the draw reads the title's image (`SRV`) and writes **our copy** of
-//! it (`RTV`, made once, of the same size and format); then one
-//! `CopyTextureRegion` puts the copy back. Both the title's targets and our
-//! copy are let go before the copy runs, and `crate::draw`'s `replay` sets
-//! the title's targets, viewports and scissors again as soon as this
-//! module returns.
+//! So the image is first **copied into** our own image (`pass.copy`, same
+//! size and format, `COPY_SOURCE` → `COPY_DEST`) and the draw reads that
+//! copy (`SRV`) and writes the title's image itself (`RTV`). The copy is
+//! therefore always filled before anything reads it, and nothing is ever
+//! copied out of a pass's own target. The image is let go as a target
+//! before the copy runs and bound again as one for the draw; `crate::draw`'s
+//! `replay` sets the title's targets, viewports and scissors again as soon
+//! as this module returns.
 //!
 //! Off by default, and with `VICTORY_GRADE` set to anything else: [`on`]
 //! is false, nothing is recorded and no state is touched.
@@ -271,14 +273,17 @@ struct Pass {
     pso: ID3D12PipelineState,
     /// The shader-visible heap holding the one view the pass reads.
     views: ID3D12DescriptorHeap,
-    /// The heap holding the one view it writes.
-    targets: ID3D12DescriptorHeap,
-    /// Our copy of the colour: written by the pass, then copied back. Kept
-    /// in the render-target state between runs.
+    /// Our copy of the colour: the copy is filled from the image, then read
+    /// by the draw. Kept in the common state between runs.
     copy: ID3D12Resource,
     width: u32,
     height: u32,
+    /// The image's own format, which our copy is made in: both sides of the
+    /// copy name one format.
     format: DXGI_FORMAT,
+    /// The format the views name: `format`, or the encode's concrete format
+    /// when `format` is typeless (a view cannot name a typeless one).
+    view: DXGI_FORMAT,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -333,11 +338,34 @@ fn compile(
     .to_vec())
 }
 
+/// Whether `format` is one of DXGI's typeless ones: the name of a family
+/// (another member of that family is what [`crate::resource::family`] gives
+/// back for it). A view may not name one.
+fn typeless(format: u32) -> bool {
+    crate::resource::family(format) == format
+        && (0..=200).any(|member| member != format && crate::resource::family(member) == format)
+}
+
+/// The format the pass's views must name over the image: the image's own,
+/// unless that is typeless — then the concrete `named` format the encode
+/// already reads it through, which is a member of the image's family (the
+/// title made that view). `None` when neither is usable.
+fn view_format(own: DXGI_FORMAT, named: Option<u32>) -> Option<DXGI_FORMAT> {
+    if own == DXGI_FORMAT_UNKNOWN {
+        return None;
+    }
+    if !typeless(own.0 as u32) {
+        return Some(own);
+    }
+    named.map(|format| DXGI_FORMAT(format as i32))
+}
+
 fn make(
     device: &ID3D12Device,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    view: DXGI_FORMAT,
     style: Style,
 ) -> windows::core::Result<Pass> {
     let source = match style {
@@ -363,7 +391,7 @@ fn make(
         let mut blend = D3D12_BLEND_DESC::default();
         blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
         let mut formats = [DXGI_FORMAT(0); 8];
-        formats[0] = format;
+        formats[0] = view;
         let pso: ID3D12PipelineState =
             device.CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -400,7 +428,7 @@ fn make(
                 Count: 1,
                 Quality: 0,
             },
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
             ..Default::default()
         };
         let heap = D3D12_HEAP_PROPERTIES {
@@ -408,11 +436,13 @@ fn make(
             ..Default::default()
         };
         let mut copy: Option<ID3D12Resource> = None;
+        // Common at the start and at the end of every recording, as the
+        // exposure pass's own copy is: every run records the same barriers.
         device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COMMON,
             None,
             &mut copy,
         )?;
@@ -428,7 +458,7 @@ fn make(
                 NodeMask: 0,
             })?;
         let seen = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: format,
+            Format: view,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -443,36 +473,17 @@ fn make(
             Some(&seen),
             views.GetCPUDescriptorHandleForHeapStart(),
         );
-        let targets: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: 1,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-                NodeMask: 0,
-            })?;
-        let written = D3D12_RENDER_TARGET_VIEW_DESC {
-            Format: format,
-            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_RTV::default(),
-            },
-        };
-        device.CreateRenderTargetView(
-            &copy,
-            Some(&written),
-            targets.GetCPUDescriptorHandleForHeapStart(),
-        );
         Ok(Pass {
             style,
             knobs,
             root,
             pso,
             views,
-            targets,
             copy,
             width,
             height,
             format,
+            view,
         })
     }
 }
@@ -490,10 +501,12 @@ fn subresource(texture: &ID3D12Resource) -> D3D12_TEXTURE_COPY_LOCATION {
 }
 
 /// Records, in `list`, the pass `VICTORY_GRADE` asks for over `image`: the
-/// image is read through `format` (`None`: the resource's own) and written
-/// back — as it is, or through the highlight curve. Returns whether anything
-/// was recorded (the list's targets, descriptor heap, root signature and
-/// pipeline are then ours, and the caller sets the title's again).
+/// image is copied into our own image, read from there and written back into
+/// the image — as it is, or through the highlight curve. `format` is the
+/// format the encode already reads the image through; it is used only when
+/// the image's own is typeless. Returns whether anything was recorded (the
+/// list's targets, descriptor heap, root signature and pipeline are then
+/// ours, and the caller sets the title's again).
 pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> bool {
     let Some(style) = style() else {
         return false;
@@ -526,19 +539,49 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
         });
         return false;
     }
-    let format = DXGI_FORMAT(format.unwrap_or(d.Format.0 as u32) as i32);
+    // The pass writes the image itself, so the image must be one.
+    if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = d.Format.0,
+                "no grade (VICTORY_GRADE): the colour it would write is not a render target"
+            )
+        });
+        return false;
+    }
+    let Some(view) = view_format(d.Format, format) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = d.Format.0,
+                named = format,
+                "no grade (VICTORY_GRADE): the colour's format cannot be named by a view"
+            )
+        });
+        return false;
+    };
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     let Some(pass) = PASS
         .get_or_init(|| {
-            make(&host.device, d.Width as u32, d.Height as u32, format, style)
-                .inspect_err(|e| tracing::warn!(error = %e, "no grade (VICTORY_GRADE)"))
-                .ok()
+            make(
+                &host.device,
+                d.Width as u32,
+                d.Height as u32,
+                d.Format,
+                view,
+                style,
+            )
+            .inspect_err(|e| tracing::warn!(error = %e, "no grade (VICTORY_GRADE)"))
+            .ok()
         })
         .as_ref()
     else {
         return false;
     };
-    if (pass.width, pass.height, pass.format) != (d.Width as u32, d.Height as u32, format) {
+    if (pass.width, pass.height, pass.format, pass.view)
+        != (d.Width as u32, d.Height as u32, d.Format, view)
+    {
         // The copy is made for one size and format; another colour image
         // would be written with the wrong texels.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -559,12 +602,14 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
             width = pass.width,
             height = pass.height,
             format = pass.format.0,
+            view = pass.view.0,
             "the finished colour is read and written back as it is (VICTORY_GRADE=identity)"
         ),
         Style::Curve => tracing::info!(
             width = pass.width,
             height = pass.height,
             format = pass.format.0,
+            view = pass.view.0,
             knee = pass.knobs.knee,
             strength = pass.knobs.strength,
             "the finished colour gets the highlight curve (VICTORY_GRADE=curve)"
@@ -577,12 +622,8 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
     // first. `crate::draw` sets the title's again when this returns.
     // SAFETY: an open list, and no view outlives the call.
     unsafe { l.OMSetRenderTargets(0, None, false, None) };
-    // The colour, where the draw reads it.
-    crate::list::ensure_state(
-        list,
-        image,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32,
-    );
+    // The image, where the copy reads it ...
+    crate::list::ensure_state(list, image, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
     let viewport = D3D12_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,
@@ -597,14 +638,52 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
         right: pass.width as i32,
         bottom: pass.height as i32,
     };
+    // ... into our copy, which the draw then reads. The copy is common at
+    // the start of every recording and left so at its end.
+    // SAFETY: an open list and live textures of one size and format.
+    unsafe {
+        l.ResourceBarrier(&[crate::host::transition(
+            &pass.copy,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        l.CopyTextureRegion(
+            &subresource(&pass.copy),
+            0,
+            0,
+            0,
+            &subresource(&texture),
+            None,
+        );
+        // The barrier into a shader-read state also orders the copy's
+        // writes before the draw that reads them.
+        l.ResourceBarrier(&[crate::host::transition(
+            &pass.copy,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        )]);
+    }
+    // The image is what the pass writes, and what the encode expects after
+    // its last writer.
+    crate::list::ensure_state(list, image, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+    let written = D3D12_RENDER_TARGET_VIEW_DESC {
+        Format: pass.view,
+        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_RTV::default(),
+        },
+    };
+    // A render-target view of the image lives only until this draw is
+    // recorded (`Host::rtv`): the title's own targets are the caller's to
+    // restore.
+    let target = host.rtv(Some(&texture), Some(&written));
     // SAFETY: an open list; the pass's own heap, root signature and
-    // pipeline; the colour in the shader-read state, our copy in the
-    // render-target one.
+    // pipeline; the colour in the render-target state as its target, our
+    // copy in the shader-read one as its source.
     unsafe {
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetGraphicsRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        let target = pass.targets.GetCPUDescriptorHandleForHeapStart();
         l.OMSetRenderTargets(1, Some(&target as *const _), false, None);
         match pass.style {
             // The identity: the one table, no constant at all.
@@ -630,37 +709,13 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
         crate::draw::viewports(list, &[viewport]);
         crate::draw::scissors(list, &[whole]);
         l.DrawInstanced(3, 1, 0, 0);
-        // Our copy is still bound as a target: let it go before reading it.
-        l.OMSetRenderTargets(0, None, false, None);
+        // The draw has read our copy: only now may it rest in common again.
         l.ResourceBarrier(&[crate::host::transition(
             &pass.copy,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
         )]);
     }
-    crate::list::ensure_state(list, image, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
-    // SAFETY: an open list and live textures of one size and format.
-    unsafe {
-        l.CopyTextureRegion(
-            &subresource(&texture),
-            0,
-            0,
-            0,
-            &subresource(&pass.copy),
-            None,
-        )
-    };
-    // Back to the state the title's last writer left it in, for the encode.
-    crate::list::ensure_state(list, image, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
-    // SAFETY: as above; our copy stays in the render-target state between
-    // runs, so every run records the same barriers.
-    unsafe {
-        l.ResourceBarrier(&[crate::host::transition(
-            &pass.copy,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-        )])
-    };
     true
 }
 
@@ -772,6 +827,81 @@ mod tests {
         }
     }
 
+    /// The views name a concrete format: the image's own when it is one; the
+    /// encode's concrete `named` one only when the image is typeless, which
+    /// no view may name.
+    #[test]
+    fn the_views_name_a_concrete_format() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        // Concrete: its own name, whatever the encode says.
+        for own in [
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ] {
+            assert!(!super::typeless(own.0 as u32), "{own:?}");
+            assert_eq!(
+                super::view_format(own, Some(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32)),
+                Some(own)
+            );
+            assert_eq!(super::view_format(own, None), Some(own));
+        }
+        // Typeless: the family's own name, and the encode's concrete one is
+        // used; without it there is no view, so nothing is recorded.
+        for own in [
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            DXGI_FORMAT_R10G10B10A2_TYPELESS,
+            DXGI_FORMAT_R16G16B16A16_TYPELESS,
+        ] {
+            assert!(super::typeless(own.0 as u32), "{own:?}");
+            assert_eq!(super::view_format(own, None), None);
+        }
+        assert_eq!(
+            super::view_format(
+                DXGI_FORMAT_R10G10B10A2_TYPELESS,
+                Some(DXGI_FORMAT_R10G10B10A2_UNORM.0 as u32)
+            ),
+            Some(DXGI_FORMAT_R10G10B10A2_UNORM)
+        );
+        assert_eq!(super::view_format(DXGI_FORMAT_UNKNOWN, Some(28)), None);
+    }
+
+    /// The vertex program's triangle covers the whole viewport and every
+    /// pixel reads its own texel: `p` is (0,0), (2,0), (0,2) and `at` is
+    /// `p * 2 - 1`, so the three vertices are (-1,-1), (3,-1) and (-1,3),
+    /// which hold the whole clip square.
+    #[test]
+    fn the_triangle_covers_the_whole_image() {
+        // The vertex program, mirrored.
+        let at: Vec<(f32, f32)> = (0..3u32)
+            .map(|id| {
+                let p = (
+                    ((id << 1) & 2) as f32,
+                    (id & 2) as f32,
+                );
+                (p.0 * 2.0 - 1.0, p.1 * 2.0 - 1.0)
+            })
+            .collect();
+        assert_eq!(at, vec![(-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)]);
+        // The edge functions of the triangle: all of one sign inside it.
+        let edge = |a: (f32, f32), b: (f32, f32), q: (f32, f32)| {
+            (b.0 - a.0) * (q.1 - a.1) - (b.1 - a.1) * (q.0 - a.0)
+        };
+        let inside = |q: (f32, f32)| {
+            [
+                edge(at[0], at[1], q),
+                edge(at[1], at[2], q),
+                edge(at[2], at[0], q),
+            ]
+            .iter()
+            .all(|&w| w >= 0.0)
+        };
+        // Every corner of the viewport, and its centre, are covered.
+        for q in [(-1.0f32, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0), (0.0, 0.0)] {
+            assert!(inside(q), "{q:?} outside the triangle");
+        }
+    }
+
     /// Both passes compile with the system's compiler and the host takes
     /// them (small copies, so the tests need no 1920x1080 allocation). The
     /// host is absent outside the game, where the test returns and the
@@ -783,7 +913,7 @@ mod tests {
         };
         let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
         for style in [Style::Identity, Style::Curve] {
-            super::make(&host.device, 16, 16, format, style)
+            super::make(&host.device, 16, 16, format, format, style)
                 .unwrap_or_else(|e| panic!("the {style:?} pass: {e}"));
         }
     }
