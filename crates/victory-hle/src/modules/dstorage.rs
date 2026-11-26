@@ -1100,7 +1100,16 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        // The decode writes straight into the title's memory through this
+        // window, and it runs long: a `guard()` on another thread that arms
+        // these blocks read-only again under it faults inside the inflate's
+        // own code (`zlib_rs::inflate::inflate_fast_help_avx2`) while it
+        // writes, where the guards cannot take it up. Held open over `fill`,
+        // as the branch above does for its read.
+        let (at, n) = (window.bytes().as_ptr() as usize, window.bytes().len());
+        let writing = victory_gpu::kernel_will_write_held(at, n);
         let filled = fill(window.bytes()).map(drop);
+        drop(writing);
         drop(window);
         // The title maps pages where the card reads them and has them
         // filled afterwards: the GPU side's copies of those addresses
