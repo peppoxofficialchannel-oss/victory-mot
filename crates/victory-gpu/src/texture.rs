@@ -648,7 +648,17 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
-pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+///
+/// True: the texture has its staging buffer, so what it holds is on the
+/// card by the time this list has run (or was already, and nothing was
+/// detiled since). False: it has none — the card would not give the
+/// staging buffer, or the texture cannot be staged at all — and nothing of
+/// the texture was copied, nor of its memory taken (the take is the
+/// detiling, which only a staging buffer has). Only the pass over textures
+/// picked by index reads it, and only with `VICTORY_TEXTURE_RETRY_REFUSED`
+/// ([`crate::draw`]): otherwise a slot whose upload was refused is taken
+/// as loaded, as it was before.
+pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -657,10 +667,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {
-        return;
+        return true;
     }
     let Some(staging) = staging(resource, texture) else {
-        return;
+        return false;
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
@@ -698,7 +708,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
-        return;
+        return true;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -774,7 +784,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
-        return;
+        return true;
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
@@ -786,6 +796,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             crate::descriptor::host::levels_waiting(staging.memory as u64);
         }
     });
+    true
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1279,6 +1290,21 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     };
     let size = s.layout.size as usize;
     Some((size as u64, committed(s.memory, size)))
+}
+
+/// Whether `resource`'s staging buffer holds bytes no list has copied to the
+/// card since: the refresh at a submission detiled title memory into it, and
+/// the copy of that submission was one the upload skipped as not needed (the
+/// host texture had the staging buffer's contents when the list was
+/// recorded, and the title wrote the memory after it). The next `upload`
+/// copies them. Asked only with `VICTORY_TEXTURE_RECHECK_DIRTY`, which is
+/// on by default (`crate::draw::texture_recheck_dirty`).
+pub(crate) fn staged_dirty(resource: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(|staging| staging.dirty.load(Relaxed))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be

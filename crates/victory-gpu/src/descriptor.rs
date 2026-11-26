@@ -186,6 +186,10 @@ pub(crate) fn sync_heaps() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    if crate::ablate::ablated(crate::ablate::SYNC) {
+        return;
+    }
+    let _sync = crate::trace::span("sync");
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();

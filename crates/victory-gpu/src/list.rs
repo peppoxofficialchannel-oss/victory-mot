@@ -140,9 +140,20 @@ const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
-/// is a host GPU.
+/// is a host GPU. VICTORY_ABLATE=record skips the recording of the call
+/// (`f`) but not a list's reset, which goes through [`with_state_always`].
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    if crate::ablate::ablated(crate::ablate::RECORD) {
+        return;
+    }
+    let _record = crate::trace::span("record");
+    with_state_always(this, f);
+}
+
+/// [`with_state`] without the ablation: what a list's reset needs.
+#[cfg(windows)]
+fn with_state_always(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -655,7 +666,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    with_state_always(this, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
@@ -1384,6 +1395,12 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
+                // Before the bytes land, as every other writer of title
+                // memory does: this one copies an arbitrary length (the
+                // 256 KiB of run rt2's `long25`) and a guarded block under
+                // it must be opened first, or the copy faults in code the
+                // handler does not take and the run dies.
+                crate::watch::writing(dst as usize, len);
                 // SAFETY: both ranges are committed title memory.
                 unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
             }

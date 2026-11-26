@@ -3654,6 +3654,12 @@ fn relay_worker() {
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
 fn relay_hand_back(back: &[Declared]) {
+    // VICTORY_ABLATE=copyback: nothing goes back; the caller still closes
+    // every flight's ranges after this (`copy_back_done`).
+    if crate::ablate::ablated(crate::ablate::COPYBACK) {
+        return;
+    }
+    let _back = crate::trace::span("copyback");
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
@@ -3958,6 +3964,16 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    // VICTORY_ABLATE=copyback: nothing goes back into title memory, but the
+    // ranges are still done with (as `VICTORY_COPYBACK_OFF` has it) so that
+    // another submission's declares do not find them held.
+    if crate::ablate::ablated(crate::ablate::COPYBACK) {
+        for (shadow, declared) in back {
+            shadow.copy_back_done(declared);
+        }
+        return;
+    }
+    let _back = crate::trace::span("copyback");
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -7291,6 +7307,10 @@ impl HostList {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    if crate::ablate::ablated(crate::ablate::COPY) {
+                        continue;
+                    }
+                    let _copy = crate::trace::span("copy");
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -7309,6 +7329,10 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    if crate::ablate::ablated(crate::ablate::COPY) {
+                        continue;
+                    }
+                    let _copy = crate::trace::span("copy");
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -7319,6 +7343,10 @@ impl HostList {
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
+                    if crate::ablate::ablated(crate::ablate::COPY) {
+                        continue;
+                    }
+                    let _copy = crate::trace::span("copy");
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Refreshes, 1);
@@ -7362,6 +7390,10 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
+                    if crate::ablate::ablated(crate::ablate::TEXTURES) {
+                        continue;
+                    }
+                    let _textures = crate::trace::span("textures");
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
@@ -7508,6 +7540,10 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        if crate::ablate::ablated(crate::ablate::COPY) {
+            return;
+        }
+        let _copy = crate::trace::span("copy");
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
@@ -8161,6 +8197,17 @@ impl Meter {
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
+            // The slots whose shader view the host could not make and that
+            // were bound to the 1x1 fallback instead (`VICTORY_NULL_TEXTURE`);
+            // silent while there are none, and always with `black`.
+            let fallback = crate::descriptor::host::NULL_TEXTURE_USES.load(Ordering::Relaxed);
+            if fallback > 0 {
+                tracing::info!(
+                    "descriptor slots with no makeable texture view read the 1x1 fallback texture instead ({}): {fallback} \
+                     since the start (VICTORY_NULL_TEXTURE; black keeps the null views that read zeros)",
+                    crate::descriptor::host::null_texture_name()
+                );
+            }
             tracing::info!(
                 "copies left out since the start because both sides were one host texture: {}",
                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
@@ -8202,6 +8249,17 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
                     looked as f64 / passes.max(1) as f64
                 );
+                // `VICTORY_TEXTURE_RETRY_REFUSED`: what the slots whose
+                // upload was refused cost. No line with the switch off,
+                // where the counter is never raised and the pass is the one
+                // it was before it.
+                if crate::draw::texture_retry_refused() {
+                    tracing::info!(
+                        "textures picked by index: {} uploads refused for want of a staging buffer, each looked at again \
+                         instead of being taken as uploaded (VICTORY_TEXTURE_RETRY_REFUSED)",
+                        crate::draw::HEAP_TEXTURES_REFUSED.load(Ordering::Relaxed)
+                    );
+                }
             }
             {
                 let mode = crate::watch::page_writes();

@@ -998,9 +998,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        // After the unmapping, not before: `title_memory_remapped` opens a
+        // block the guards hold read-only, and told before the unmap it
+        // leaves the block read-only in no set while the view still shows it
+        // — a write there then dies unannounced (rt2, `long25`). The unmap
+        // must have happened first, so its failure is said too.
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let unmapped = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1009,6 +1013,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        if unmapped == 0 {
+            tracing::warn!(
+                address = format_args!("{at:#x}"),
+                len = size,
+                error = %std::io::Error::last_os_error(),
+                "unmapping physical pages failed (not a view?)"
+            );
+        }
+        // What the range shows is new (a placeholder, or the view the failed
+        // unmap left): the guards' blocks there are opened and forgotten.
+        victory_gpu::title_memory_remapped(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

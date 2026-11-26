@@ -3047,7 +3047,7 @@ impl Shadow {
         };
         let page = at / PAGE;
         let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
-        let (before, now) = crate::watch::wrote_own(page, &others);
+        let (before, now) = crate::watch::wrote_own(at, bytes.len(), &others);
         // A placed texture there changed with no descriptor written (what
         // `crate::watch::writing` tells the texture table on the old way).
         crate::descriptor::host::remapped(at, bytes.len());

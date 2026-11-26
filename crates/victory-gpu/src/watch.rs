@@ -108,6 +108,19 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// The parts of the page numbered `page` that the bytes `[at, end)` touch (a
+/// bit for each 4 KiB): the mask the kernel's answer would give for a write
+/// of ours into a known range. `WHOLE` if the range is not in the page.
+fn parts_in(page: usize, at: usize, end: usize) -> u16 {
+    let (a, b) = ((page * PAGE).max(at), ((page + 1) * PAGE).min(end));
+    if a >= b {
+        return WHOLE;
+    }
+    let first = (a - page * PAGE) / KERNEL_PAGE;
+    let past = (b - page * PAGE).div_ceil(KERNEL_PAGE);
+    (u16::MAX << first) & (u16::MAX >> (PARTS - past))
+}
+
 impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
@@ -140,7 +153,33 @@ impl Journal {
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+    let parts: Vec<u16> = pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect();
+    #[cfg(feature = "diagnostics")]
+    count_parts(&parts);
+    parts
+}
+
+/// Since the start: pages a refresh took again with a real mask, and whole
+/// (a line every 65,536 calls; `VICTORY_TAKE_PARTS=1` only).
+#[cfg(feature = "diagnostics")]
+fn count_parts(parts: &[u16]) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    if !parts_on() || parts.is_empty() {
+        return;
+    }
+    let masked = parts.iter().filter(|&&p| p != WHOLE).count() as u64;
+    SEEN[1].fetch_add(masked, Relaxed);
+    SEEN[2].fetch_add(parts.len() as u64 - masked, Relaxed);
+    let calls = SEEN[0].fetch_add(1, Relaxed) + 1;
+    if calls.is_multiple_of(65536) {
+        tracing::info!(
+            calls,
+            masked = SEEN[1].load(Relaxed),
+            whole = SEEN[2].load(Relaxed),
+            "pages taken again with the 4 KiB parts written, and whole (VICTORY_TAKE_PARTS=1), since the start"
+        );
+    }
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -188,6 +227,9 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    // The kernel's answer names the 4 KiB page that was written, not the 64
+    // KiB one: `ask_kernel` notes which part it is (`VICTORY_TAKE_PARTS`),
+    // so the copies that `writes` answers from here can be cut to it.
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -336,20 +378,23 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.note(page, WHOLE, now);
+    // The bytes are ours and known: the parts they touch are the mask the
+    // kernel would give (not `WHOLE`, which would throw away the offset).
+    let end = at.saturating_add(len);
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        j.note(page, parts_in(page, at, end), now);
     }
 }
 
-/// We wrote the 64 KiB page numbered `page` of title memory through a
-/// view of our own (`crate::inplace::write_own`): no guard was opened and
-/// no kernel write-watch bit set, so the journal is told here. The page,
-/// and the same physical page at its other title addresses (`others`,
-/// page numbers), count as written at a new asking, which every host copy
-/// that holds them takes at its next refresh. Returns the asking that had
-/// last found `page` written (0: never) and the new one, for the copy
-/// that wrote to note itself current.
-pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+/// We wrote `[at, at + len)` of title memory through a view of our own
+/// (`crate::inplace::write_own`): no guard was opened and no kernel
+/// write-watch bit set, so the journal is told here. The page holding `at`,
+/// and the same physical page at its other title addresses (`others`, page
+/// numbers), count as written at a new asking, which every host copy that
+/// holds them takes at its next refresh. Returns the asking that had last
+/// found the page written (0: never) and the new one, for the copy that
+/// wrote to note itself current.
+pub(crate) fn wrote_own(at: usize, len: usize, others: &[usize]) -> (u64, u64) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     j.asked += 1;
@@ -360,10 +405,14 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.note(page, WHOLE, now);
+    // The parts the bytes touch are known here too; the page's other title
+    // addresses are the same physical page, so the same parts.
+    let page = at / PAGE;
+    let parts = parts_in(page, at, at.saturating_add(len));
+    let before = j.note(page, parts, now);
     for &other in others {
         if other != page {
-            j.note(other, WHOLE, now);
+            j.note(other, parts, now);
         }
     }
     (before, now)
@@ -1329,6 +1378,9 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1344,6 +1396,38 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
+        // Forgetting a block that is still read-only by our hand would leave
+        // it read-only with no set knowing it: a page the guards no longer
+        // have, which the handler therefore never opens. That state is what
+        // killed the run (rt2, `long25`: a 256 KiB write of ours —
+        // `CopyMemoryToMemoryX` — over `PAGE_READONLY`, `MEM_MAPPED`, in no
+        // set). It arises when the runtime's notification arrives while the
+        // view is still mapped and guarded (`xmem`'s `unmap` told us before
+        // `UnmapViewOfFile2`, fixed there) or when a remap elsewhere in the
+        // range leaves the block as it was. Give the write access back
+        // before dropping the block from the guards, so "read-only and
+        // unregistered" cannot exist.
+        // SAFETY: plain data filled in by the query, of the right size.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY {
+            let mut old = 0;
+            // SAFETY: the block was made read-only by us; only its
+            // protection changes, and only back to write access.
+            if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0 {
+                // Left in the guards (still read-only, still known) so the
+                // next write there faults into the handler and is looked at
+                // again, instead of dying unannounced. Noted not clean: what
+                // the range shows is new, and the copies must take it.
+                g.clean.remove(&block);
+                tracing::error!(
+                    "a guarded block of title memory could not be given write access on remap: {:#x} (block {block:#x}): {}",
+                    block * BLOCK,
+                    std::io::Error::last_os_error()
+                );
+                continue;
+            }
+        }
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
@@ -1497,6 +1581,54 @@ mod tests {
             )
             .is_none()
         );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A page the kernel's answer names by its 4 KiB offset keeps that part
+    /// through the asking that stands for the submission (as `writes`
+    /// answers it): a refresh cuts the copy there (`VICTORY_TAKE_PARTS=1`);
+    /// off, the page, as before.
+    #[test]
+    fn a_page_asked_ahead_keeps_the_parts_it_was_written_in() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        ask_once_end();
+        let (taken, _) = writes(p, p + 2 * PAGE, false).expect("watched");
+        let page = p / PAGE + 1;
+        // SAFETY: committed pages of ours: the fourth 4 KiB part of page 1.
+        unsafe { ((page * PAGE + 3 * KERNEL_PAGE + 7) as *mut u8).write(1) };
+        // One asking for the submission's two ranges.
+        ask_ahead(&[(p, p + PAGE), (p + PAGE, p + 2 * PAGE)]);
+        let (_, pages) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert!(pages.iter().any(|&(p, _)| p == page));
+        let parts = parts_written(&[(page, taken)]);
+        if parts_on() {
+            assert_eq!(parts, [1 << 3]);
+            // A write of ours into part of a page is those parts, not WHOLE.
+            let at = page * PAGE + 2 * KERNEL_PAGE + 1;
+            assert_eq!(parts_in(page, at, at + 2 * KERNEL_PAGE - 1), 0b1100);
+        } else {
+            assert_eq!(parts, [WHOLE]);
+        }
+        ask_ahead_done();
+        // The journal outlives the allocation: the next test may get these
+        // pages again, and would find them written.
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in p / PAGE..=p / PAGE + 1 {
+                j.written.remove(&page);
+                j.parts.remove(&page);
+            }
+        }
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -2066,6 +2198,41 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         title_memory_remapped(filler, MANY_VIEWS * BLOCK);
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// The runtime says a block was remapped while it is still a view we
+    /// made read-only: `xmem`'s `unmap` used to tell the guards **before**
+    /// `UnmapViewOfFile2` (run rt2, `long25`), and a remap elsewhere in the
+    /// range leaves the block read-only all the same. Forgetting the block
+    /// must open it; otherwise it stays read-only with no set knowing it
+    /// (`VirtualQuery`: `PAGE_READONLY`, `MEM_MAPPED`, no guards) and the
+    /// next write of ours over it — 256 KiB in `long25`, from
+    /// `CopyMemoryToMemoryX` — dies there, out of the handler's reach.
+    #[test]
+    fn a_remapped_guarded_block_is_left_writable() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let (section, guarded, other) = two_views(BLOCK);
+        assert_eq!(guard(guarded, guarded + BLOCK), Some(vec![guarded / PAGE]));
+        // The block is read-only by our hand and known to the guards.
+        assert!(!writable(guarded), "guarded read-only");
+        assert!(guards().protected.contains(&(guarded / BLOCK)));
+        // The notification alone, the view still mapped: the interleaving
+        // `unmap` had (the notification before the unmapping).
+        title_memory_remapped(guarded, BLOCK);
+        // SAFETY: plain data filled in by the query, of the right size.
+        let protection = unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(guarded as *const _, &mut info, size_of_val(&info)), 0);
+            info.Protect
+        };
+        assert_eq!(
+            protection,
+            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            "a block the runtime remapped is not left read-only and unregistered"
+        );
+        assert!(writable(guarded));
+        assert!(!guards().protected.contains(&(guarded / BLOCK)));
+        drop_views(section, &[guarded, other], BLOCK);
     }
 
     /// A write or mapping that runs past the end of the address space (a

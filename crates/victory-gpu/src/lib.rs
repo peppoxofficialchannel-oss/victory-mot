@@ -15,6 +15,9 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+pub mod ablate;
+#[cfg(windows)]
+pub mod trace;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod bvhtrace;
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -4,11 +4,44 @@
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
+//!
+//! A slot whose shader view the host cannot make (a texture view of memory
+//! it has no host copy of, one whose resource description it refuses) used
+//! to be left a **null** view, and a null view reads zeros: as a colour,
+//! black, for as long as the slot stands. A surface whose every texture
+//! failed that way therefore went black with nothing to say whether the
+//! texture or the light around it was missing. Such slots are now bound to
+//! one 1x1 `R8G8B8A8_UNORM` texture, made once ([`null_texture`]) in the
+//! colour `VICTORY_NULL_TEXTURE` names: **`grey` by default** (`128, 128,
+//! 128, 255`, 0.5 in every channel), `magenta` (`1, 0, 1, 1`) only when the
+//! switch names it, and `black` for exactly the null views and zero reads
+//! of before, no texture made at all.
+//!
+//! Why the default is neutral and not magenta: the fallback is bound
+//! wherever a texture view cannot be made, and not every such slot is a
+//! surface's albedo. Probes, shadow masks and light volumes are bound the
+//! same way, and a shader reads whatever is there as **light**: a bright
+//! magenta there does not mark one missing texture, it tints the whole
+//! scene through the lighting (purple skin, magenta walls, run trace3). A
+//! neutral 0.5 adds 0.5 of nothing in particular and leaves the picture
+//! readable. `magenta` is kept as a name to ask for on purpose, for a short
+//! diagnostic run where spotting the slot matters more than the picture
+//! (see [`NullColour::Magenta`]).
+//!
+//! The switch is the test: a surface that turns `magenta` lost its texture;
+//! with the default, a slot that should have had one shows an implausible
+//! flat 0.5 instead. [`NULL_TEXTURE_USES`] counts the slots bound, logged
+//! in a line of its own only while it is not zero.
+//! Only shader views of 2D textures and of one-slice 2D arrays are bound:
+//! buffer, unordered-access, constant and unknown slots keep their null
+//! views, which a 1x1 RGBA texture cannot stand in for.
 
 use std::sync::Mutex;
 
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
@@ -654,6 +687,22 @@ impl TextureQueue {
         }
     }
 
+    /// Nothing could be staged for slot `index` (`crate::texture::upload`
+    /// found no staging buffer to give it: the card would not make one).
+    /// What was known of an upload of it is dropped — a fingerprint kept by
+    /// [`TextureQueue::recheck`] says the card has memory it does not — and
+    /// it is looked at again as [`TextureQueue::later`] leaves a slot whose
+    /// memory is not there. Only with `VICTORY_TEXTURE_RETRY_REFUSED`
+    /// (`crate::draw`): off, the pass marks the slot loaded, as it did
+    /// before.
+    fn refused(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+        self.later(index, write, frame, most);
+        if let Some(w) = self.same(index, write) {
+            w.mapped = 0;
+            w.checked = (0, 0, 0, 0, 0);
+        }
+    }
+
     /// The card has no room for the host copy slot `index` needs: it is
     /// not handed out again before frame `due`, or before the card has
     /// room again ([`TextureQueue::room`]). Nothing else of it changes: it
@@ -753,6 +802,9 @@ impl TextureQueue {
 pub(crate) fn is_texture_view(view: &View) -> bool {
     match view {
         View::Placed(false, resource, _) => resource[0] != 1,
+        // A ray-tracing structure (11) is no texture the title fills,
+        // whatever resource object the descriptor names.
+        View::Shader(_, Some(words)) if raytracing_view(words) => false,
         View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
         _ => false,
     }
@@ -1245,6 +1297,16 @@ impl HostHeap {
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.later(index, write, frame, most);
+    }
+
+    /// Nothing could be staged for title slot `index` (the card would not
+    /// give the staging buffer): it is looked at again as
+    /// [`HostHeap::texture_slot_later`] leaves a slot, and what was known of
+    /// an upload of it is dropped ([`TextureQueue::refused`]). Only with
+    /// `VICTORY_TEXTURE_RETRY_REFUSED`.
+    pub(crate) fn texture_slot_refused(&self, index: u32, write: u64, frame: u64, most: u64) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.refused(index, write, frame, most);
     }
 
     /// See [`TextureQueue::hold`].
@@ -1751,27 +1813,9 @@ impl HostHeap {
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
-        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
-                    StructureByteStride: 0,
-                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                },
-            },
-        };
-        // SAFETY: a slot of our heap and a live buffer covering the range.
-        unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
-        };
-        self.keep(index, Some(buffer.clone()));
+        if raw_srv(self.cpu(index), buffer, offset, len) {
+            self.keep(index, Some(buffer.clone()));
+        }
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -2091,7 +2135,11 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            // A ray-tracing structure view (11) is left to no draw: the
+            // structure's address changes every frame and the dispatch that
+            // reads its nodes does so before any draw runs.
+            let raytracing = matches!(view, View::Shader(_, Some(words)) if raytracing_view(&words));
+            let later = !for_draw && !raytracing && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -2160,19 +2208,33 @@ impl HostHeap {
     }
 
     /// The view host slot `index` was made from, in a few words, with the
-    /// title and host addresses of a buffer view (diagnostics). "null" for
-    /// a slot never made or left null.
+    /// title and host addresses of a buffer view (diagnostics). A null slot
+    /// says why: made 0 (left for its draws, or made null), or a made one
+    /// with no host resource behind it (`make` refused the view).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         if key == 0 {
-            return Some("null".into());
+            return Some(
+                "null (made 0: left for its draws, or made null: never a made descriptor here)".into(),
+            );
         }
         let view = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
+        } else if let View::Shader(_, Some(words)) = &view
+            && let Some((shadow, address, len)) = raytracing_copy(words)
+        {
+            text.push_str(&format!(
+                " structure {address:#x}+{len:#x} host {:#x}",
+                shadow.gpu(address)
+            ));
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.get(index as usize).is_some_and(|r| r.is_none()) {
+            text.push_str(" (null: make refused it or wrote a null view)");
         }
         Some(text)
     }
@@ -2224,8 +2286,33 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// Whether a shader view's description names a ray-tracing structure
+/// (`ViewDimension` 11): the title addresses the structure by index in the
+/// view heap, its `Location` the structure's title address.
+fn raytracing_view(words: &[u32; 10]) -> bool {
+    words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+}
+
+/// The title address a ray-tracing structure view names, if it names one.
+fn raytracing_location(words: &[u32; 10]) -> Option<u64> {
+    if !raytracing_view(words) {
+        return None;
+    }
+    let desc = srv_desc(words);
+    // SAFETY: the union member of that dimension.
+    Some(unsafe { desc.Anonymous.RaytracingAccelerationStructure.Location })
+}
+
+/// The host copy a ray-tracing structure view's nodes are read from and the
+/// title range (address, bytes) there: from `Location` to the copy's end,
+/// which is how far the shaders read (`bufferLoad` from the slot's start).
+fn raytracing_copy(words: &[u32; 10]) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let location = raytracing_location(words)?;
+    let shadow = crate::shadow::find(location, 1)?;
+    let len = shadow.left(location);
+    Some((shadow, location, len))
+}
+
 /// The title address a buffer view or a ray-tracing structure view starts
 /// at; 0 for other views.
 fn view_address(view: &View) -> u64 {
@@ -2233,25 +2320,24 @@ fn view_address(view: &View) -> u64 {
         return start;
     }
     match view {
-        View::Shader(_, Some(words)) => {
-            let desc = srv_desc(words);
-            if desc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE {
-                // SAFETY: the union member of that dimension.
-                unsafe { desc.Anonymous.RaytracingAccelerationStructure.Location }
-            } else {
-                0
-            }
-        }
+        View::Shader(_, Some(words)) => raytracing_location(words).unwrap_or(0),
         _ => 0,
     }
 }
 
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
-            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
-            desc,
-        ),
+        View::Shader(r, Some(desc)) => {
+            // A ray-tracing structure's words are not buffer fields: what
+            // the view reads is [`raytracing_copy`]'s to say.
+            if raytracing_view(desc) {
+                return None;
+            }
+            (
+                crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
+                desc,
+            )
+        }
         View::Placed(false, resource, desc) if resource[0] == 1 => (
             u64::from(desc[10]) | u64::from(desc[11]) << 32,
             desc[..10].try_into().ok()?,
@@ -2314,6 +2400,14 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    // A ray-tracing structure reads its nodes from `Location` to the copy's
+    // end, and the copy is brought up to date for the dispatch that reads
+    // it as any buffer view's is (the slot holds no buffer fields).
+    if let View::Shader(_, Some(words)) = view
+        && raytracing_view(words)
+    {
+        return raytracing_copy(words);
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2839,6 +2933,45 @@ fn twin_uav(
     Some(desc)
 }
 
+/// A shader view of a ray-tracing structure (`ViewDimension` 11): the
+/// title's view heap holds the structure's title address in `Location`, and
+/// translated shaders read the structure's nodes through this slot as a raw
+/// buffer (`victory_shader`'s intersection). The host has no acceleration
+/// structure to make: the slot is a raw `R32_TYPELESS` view of the host copy
+/// of that memory, from `Location` to the copy's end.
+fn raytracing_srv(
+    resource: crate::object::This,
+    words: &[u32; 10],
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    let desc = srv_desc(words);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let location = raytracing_location(words)?;
+    once!(
+        resource = ?resource,
+        format = desc.Format.0,
+        first = buffer.FirstElement,
+        count = buffer.NumElements,
+        location = format_args!("{location:#x}"),
+        "a ray-tracing structure view (ViewDimension 11), made as a raw view of its host copy"
+    );
+    let shadow = crate::shadow::find(location, 1)?;
+    let offset = shadow.offset(location);
+    if !offset.is_multiple_of(16) {
+        once!(
+            location = format_args!("{location:#x}"),
+            offset,
+            "a ray-tracing structure view not on 16 bytes reads zeros"
+        );
+        return None;
+    }
+    if !raw_srv(at, &shadow.buffer, offset, shadow.left(location)) {
+        return None;
+    }
+    Some(Some(shadow.buffer.clone()))
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2865,6 +2998,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            if let Some(words) = desc
+                && raytracing_view(words)
+            {
+                return raytracing_srv(resource, words, at);
+            }
             if let Some(texture) = crate::resource::host_resource(resource) {
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
@@ -3172,6 +3310,38 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Writes at `at` a raw `R32_TYPELESS` buffer view of `len` bytes of
+/// `buffer` from byte `offset` (a multiple of 16); false if the host is
+/// gone.
+fn raw_srv(
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    buffer: &ID3D12Resource,
+    offset: u64,
+    len: u64,
+) -> bool {
+    let Some(host) = host() else { return false };
+    let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: offset / 4,
+                NumElements: elements,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    };
+    // SAFETY: a live buffer covering the range.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(buffer, Some(&desc), at)
+    };
+    true
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -3198,9 +3368,20 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    // A ray-tracing structure the host cannot make: its nodes are read by
+    // `bufferLoad`, so a null buffer view, not a 2D texture view.
+    if raytracing_view(words) {
+        return null_buffer_view(at);
+    }
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);
+    }
+    // A 2D texture, or a one-slice 2D array, the fallback texture can stand
+    // in for; the other dimensions (1D, 3D, cubes, multisampled) it cannot,
+    // and keep the null view that reads zeros.
+    if fallback_dimension(words[1]) && null_texture_view(at, words[1] == 5) {
+        return;
     }
     let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
@@ -3244,6 +3425,262 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Slots bound to the 1x1 fallback texture since the start, for the log
+/// (`VICTORY_NULL_TEXTURE`; 0 with `black`, where no fallback is used).
+pub(crate) static NULL_TEXTURE_USES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The colour `VICTORY_NULL_TEXTURE` selects for the fallback texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullColour {
+    /// `magenta` (`1, 0, 1, 1`): visible on purpose, and **only when the
+    /// switch names it**. It is not the default because the fallback also
+    /// lands in slots that feed the lighting (probes, shadow masks, light
+    /// volumes), where a bright colour is read as light and tints the whole
+    /// scene. For a short diagnostic run that wants a missing texture to
+    /// shout, not for a run whose picture is looked at.
+    Magenta,
+    /// `grey`: 0.5 in every channel, the default. A neutral stand-in: it
+    /// marks the slot without adding colour to the lighting that reads it.
+    Grey,
+}
+
+impl NullColour {
+    /// The bytes of the 1x1 `R8G8B8A8_UNORM` texture that holds it.
+    fn bytes(self) -> [u8; 4] {
+        match self {
+            NullColour::Magenta => [255, 0, 255, 255],
+            // 128 / 255 = 0.502, the 8-bit value nearest 0.5 (127 is 0.498).
+            NullColour::Grey => [128, 128, 128, 255],
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            NullColour::Magenta => "magenta",
+            NullColour::Grey => "grey",
+        }
+    }
+}
+
+/// What `VICTORY_NULL_TEXTURE` names, from its value; `None` for `black`,
+/// which keeps the null views that read zeros and makes no texture. The
+/// default (unset, or a name that is none of these) is `grey`: neutral, so
+/// it does not tint the lighting that reads it. Never a silent black: a
+/// fallback that is off has to be asked for by name.
+fn null_colour_of(setting: Option<&str>) -> Option<NullColour> {
+    match setting {
+        // Grey when the switch is unset: the fallback is on by default, and
+        // neutral (magenta here tinted the lighting: run trace3).
+        None | Some("grey") | Some("gray") => Some(NullColour::Grey),
+        // Only by name: magenta colours what it is read by, the light too.
+        Some("magenta") => Some(NullColour::Magenta),
+        Some("black") => None,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "VICTORY_NULL_TEXTURE names no colour (grey, magenta, black): grey, the neutral default"
+            );
+            Some(NullColour::Grey)
+        }
+    }
+}
+
+/// [`null_colour_of`] of the environment, read once.
+fn null_colour() -> Option<NullColour> {
+    static SETTING: std::sync::OnceLock<Option<NullColour>> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let setting = std::env::var("VICTORY_NULL_TEXTURE").ok();
+        null_colour_of(setting.as_deref())
+    })
+}
+
+/// The fallback's colour as `VICTORY_NULL_TEXTURE` names it (`black` when
+/// it is off), for the log.
+pub(crate) fn null_texture_name() -> &'static str {
+    null_colour().map_or("black", NullColour::name)
+}
+
+/// Whether a null view of a texture of `dimension` (`D3D12_SRV_DIMENSION`)
+/// may be replaced by the 1x1 fallback: the 2D texture and the one-slice 2D
+/// array. A 1x1 2D texture cannot back a 1D, 3D, cube or multisampled view
+/// (GPU-based validation reports the mismatch and the hardware reads
+/// nothing sound), so those keep their null views.
+fn fallback_dimension(dimension: u32) -> bool {
+    matches!(dimension, 4 | 5)
+}
+
+/// The 1x1 texture bound in place of a null shader view of a texture.
+struct NullTexture(ID3D12Resource);
+
+// SAFETY: a D3D12 resource is free-threaded, and this one is made once and
+// only read from then on.
+unsafe impl Send for NullTexture {}
+// SAFETY: as above.
+unsafe impl Sync for NullTexture {}
+
+/// The fallback texture, made at the first slot that needs it; `None` with
+/// `VICTORY_NULL_TEXTURE=black` or if it cannot be made, where the null
+/// views stand as before.
+fn null_texture(host: &crate::host::Host) -> Option<&'static NullTexture> {
+    static MADE: std::sync::OnceLock<Option<NullTexture>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let colour = null_colour()?;
+        let texture = make_null_texture(host, colour)?;
+        tracing::info!(
+            colour = colour.name(),
+            "a descriptor the host cannot make reads this 1x1 R8G8B8A8_UNORM texture of this colour from here on \
+             (VICTORY_NULL_TEXTURE; black keeps the null views, which read zeros)"
+        );
+        Some(NullTexture(texture))
+    })
+    .as_ref()
+}
+
+/// Binds the 1x1 fallback to slot `at`, as a 2D view (`array`: a
+/// one-slice 2D array), and counts it. `false` if the fallback is off or
+/// could not be made, and the caller writes its null view as before.
+fn null_texture_view(at: D3D12_CPU_DESCRIPTOR_HANDLE, array: bool) -> bool {
+    let Some(host) = host() else { return false };
+    let Some(fallback) = null_texture(host) else { return false };
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: if array {
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+        } else {
+            D3D12_SRV_DIMENSION_TEXTURE2D
+        },
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: if array {
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            }
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            }
+        },
+    };
+    // SAFETY: a slot of our heap and the live 1x1 texture, which outlives it.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(&fallback.0, Some(&desc), at)
+    };
+    NULL_TEXTURE_USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Makes the 1x1 texture of `colour`, filled by a copy of its four bytes
+/// through a list of our own, waited for here: it is read by shaders only
+/// after this returns. `None` (with the reason logged) if the device
+/// refuses any part of it.
+fn make_null_texture(host: &crate::host::Host, colour: NullColour) -> Option<ID3D12Resource> {
+    // SAFETY: plain creations of objects of our own; the copy list is made,
+    // run and waited for here, and the resources it names outlive the run.
+    unsafe {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        if let Err(e) = host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut made,
+        ) {
+            tracing::warn!(error = %e, "no 1x1 texture for the null descriptor fallback: null views stay");
+            return None;
+        }
+        let texture = made?;
+        crate::host::name(&texture, || format!("null texture 1x1 ({})", colour.name()));
+        // The four bytes at the start of a row pitched 256, as a copy of a
+        // texture region out of a buffer needs.
+        let (upload, data) = host.upload_buffer(256)?;
+        std::slice::from_raw_parts_mut(data, 4).copy_from_slice(&colour.bytes());
+        let allocator: ID3D12CommandAllocator = host
+            .device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .ok()?;
+        let list: ID3D12GraphicsCommandList = host
+            .device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+            .ok()?;
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&upload),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 1,
+                        Height: 1,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        // COMMON from then on: reads promote it where they run, and nothing
+        // of ours transitions the title's textures either.
+        list.ResourceBarrier(&[crate::host::transition(
+            &texture,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+        list.Close().ok()?;
+        let commands: ID3D12CommandList = windows::core::Interface::cast(&list).ok()?;
+        host.queue().ExecuteCommandLists(&[Some(commands)]);
+        let fence: ID3D12Fence = host
+            .device
+            .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            .ok()?;
+        host.queue().Signal(&fence, 1).ok()?;
+        let event = CreateEventW(None, false, false, None).ok()?;
+        let filled =
+            fence.SetEventOnCompletion(1, event).is_ok() && WaitForSingleObject(event, 10_000).0 == 0;
+        let _ = CloseHandle(event);
+        if !filled {
+            tracing::warn!("the 1x1 null texture was not filled in time: null views stay");
+            return None;
+        }
+        Some(texture)
+    }
 }
 
 #[cfg(test)]
@@ -3330,6 +3767,57 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// `VICTORY_NULL_TEXTURE` names the fallback's colour; the default is
+    /// `grey` (neutral: it does not tint the lighting), `magenta` only when
+    /// the switch names it, and `black` — the only way to get today's null
+    /// views — reads no texture at all. An unknown value is the neutral
+    /// default with a warning, never a silent black. Only 2D views and
+    /// one-slice 2D arrays can be stood in for.
+    #[test]
+    fn the_null_texture_switch_names_a_colour_and_black_keeps_the_nulls() {
+        assert_eq!(null_colour_of(None), Some(NullColour::Grey));
+        assert_eq!(null_colour_of(Some("magenta")), Some(NullColour::Magenta));
+        assert_eq!(null_colour_of(Some("grey")), Some(NullColour::Grey));
+        assert_eq!(null_colour_of(Some("gray")), Some(NullColour::Grey));
+        assert_eq!(null_colour_of(Some("black")), None);
+        assert_eq!(null_colour_of(Some("blue")), Some(NullColour::Grey));
+        assert_eq!(NullColour::Magenta.bytes(), [255, 0, 255, 255]);
+        assert_eq!(NullColour::Grey.bytes(), [128, 128, 128, 255]);
+        assert!(fallback_dimension(4));
+        assert!(fallback_dimension(5));
+        // 1D, 1D array, multisampled, 3D, cube, cube array
+        for dimension in [1, 2, 3, 6, 7, 8, 9, 10] {
+            assert!(!fallback_dimension(dimension), "{dimension}");
+        }
+    }
+
+    /// The 1x1 fallback is made, filled and bound on the real device, which
+    /// does not lose the device over it. Its colour is `VICTORY_NULL_TEXTURE`'s
+    /// — `grey` when the switch says nothing, the neutral default.
+    #[test]
+    fn the_1x1_null_texture_is_made_and_bound() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if std::env::var_os("VICTORY_NULL_TEXTURE").is_none() {
+            assert_eq!(null_texture_name(), "grey");
+        }
+        let Some(fallback) = null_texture(host) else {
+            return; // VICTORY_NULL_TEXTURE=black
+        };
+        // SAFETY: a plain description of the live texture.
+        let desc = unsafe { fallback.0.GetDesc() };
+        assert_eq!((desc.Width, desc.Height, desc.MipLevels), (1, 1, 1));
+        assert_eq!(desc.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert!(null_texture_view(heap.cpu(0), false));
+        assert!(null_texture_view(heap.cpu(1), true));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
@@ -3474,6 +3962,38 @@ mod tests {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    /// A slot whose upload was refused (the card would not give a staging
+    /// buffer) is not taken as uploaded — with `VICTORY_TEXTURE_RETRY_REFUSED`,
+    /// which is off by default (`crate::draw::texture_retry_refused`): what
+    /// the upload before knew of it is dropped, the fingerprint a look would
+    /// compare against and the bytes it found mapped, and it is looked at
+    /// again 1, 2, 4, ... frames later, counted among the slots waiting as
+    /// one nothing was uploaded for (Marvisak #3174).
+    #[test]
+    fn a_refused_upload_keeps_its_slot_and_forgets_the_upload_before_it() {
+        let mut q = TextureQueue::default();
+        q.written(40, 1, 0, false);
+        let write = q.due(1, 100).iter().find(|d| d.0 == 40).unwrap().1;
+        // Uploaded whole from the memory at 0x1000, fingerprint 0xabc.
+        q.recheck(40, write, 3, (0x1000, 0x400), 0xabc, 0, 1);
+        assert_eq!(q.checked(40), Some((0x1000, 0x400, 0xabc, 0, 1)));
+        // Its next upload is refused at frame 3.
+        q.refused(40, write, 3, 8);
+        assert_eq!(q.checked(40), None, "the look no longer finds it uploaded");
+        assert!(!q.due(4, 100).iter().any(|d| d.0 == 40), "looked at again in 2 frames");
+        assert!(q.due(5, 100).iter().any(|d| d.0 == 40));
+        assert_eq!(q.census(5)[2], 1, "counted as waiting for what it has not");
+        // Refused again at 5: 4 frames later, still nothing taken.
+        let again = q.due(5, 100).iter().find(|d| d.0 == 40).unwrap().1;
+        q.refused(40, again, 5, 8);
+        assert_eq!(q.checked(40), None);
+        assert!(!q.due(8, 100).iter().any(|d| d.0 == 40));
+        assert!(q.due(9, 100).iter().any(|d| d.0 == 40));
+        // And a slot written again meanwhile is the title's write, as before.
+        q.written(40, 9, 0, false);
+        assert!(q.due(9, 100).iter().any(|d| d.0 == 40));
     }
 
     /// Textures of which only the smallest levels are held, packed into

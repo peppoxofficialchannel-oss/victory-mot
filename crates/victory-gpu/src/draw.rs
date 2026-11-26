@@ -438,6 +438,10 @@ pub(crate) static HEAP_TEXTURE_PASSES: [AtomicU64; 7] = [const { AtomicU64::new(
 /// then looked at (the loop stops early on the time or the bytes); and the
 /// most one pass looked at.
 pub(crate) static HEAP_TEXTURE_SLOTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Slots of textures picked by index whose upload could not be staged (the
+/// card would not give the staging buffer): not marked uploaded, looked at
+/// again ([`State::heap_textures`]).
+pub(crate) static HEAP_TEXTURES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -478,6 +482,76 @@ fn reupload_when_full() -> bool {
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_TEXTURE_RETRY_REFUSED=1`: the pass over textures picked by
+/// index does not take a slot as uploaded when its upload was refused —
+/// no staging buffer could be made — and looks at it again.
+///
+/// **Off by default, and it is measured.** It came from Marvisak#3174
+/// (commit `3e1c3d4d`), whose case is ours in another place: an upload
+/// refused for want of a staging buffer had taken nothing (the take lives
+/// in `Staging::refresh`, which needs the staging buffer), but the slot was
+/// marked loaded, so the texture was never uploaded for the rest of the
+/// run. Keeping the obligation is right in theory and wrong on the 6 GB
+/// card: the memory does not arrive, so the obligations only pile up.
+/// Measured with it on, on the run of 2026-11-26: 16,212 slots in the
+/// queue, 7,040 of them waiting for memory that never arrives, 2,210
+/// uploaded in part, 2,072,541 slots served in 240 s, 3,683 passes; the
+/// card 273-545 ms and the frame 676-2,540 ms a frame against 51-178 and
+/// 350-730 at the same draw count — and the world lost its material
+/// (90-100% of surfaces flat, three frames, "not playable to look at").
+/// With it off, a slot whose upload was refused is taken as loaded, as
+/// before: its texture stays as it is until the title writes the view
+/// again. Neither path loses pages: nothing of the texture's memory is
+/// taken when no staging buffer is made.
+///
+/// The other half of `3e1c3d4d` — a fingerprint that matches not being
+/// enough while the staging buffer is dirty — is [`texture_recheck_dirty`],
+/// and it is a switch of its own because the run above does not condemn it:
+/// what piled up was this branch's obligations (the slots it keeps due and
+/// the passes that serve them), and that is what the 7,040 waiting slots,
+/// the 3,683 passes and the 2,072,541 slots served measure.
+pub(crate) fn texture_retry_refused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RETRY_REFUSED").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_TEXTURE_RECHECK_DIRTY=0`: a look at a texture picked by index
+/// whose fingerprint matches its upload's passes the slot over as before,
+/// whether the staging buffer holds bytes the card was never given or not.
+/// On unless set to `0`.
+///
+/// The case it covers: `crate::texture::upload` finds the staging buffer
+/// already on the card (`uploaded && !dirty`) and records no copy — only
+/// the check at submission, which may then find what the title wrote after
+/// the list was recorded and detile it (`crate::texture::staged_dirty`).
+/// The card is one revision behind, and the look's fingerprint is of the
+/// newer bytes: taken as it was, the slot waits for a look that never
+/// uploads, and the texture keeps what it had for the rest of the run. So
+/// such a slot is uploaded now, like the one whose fingerprint differs.
+///
+/// Why this can be on while `texture_retry_refused` is off:
+/// - it cannot make a storm. It touches neither `due` nor `looks`: the slot
+///   is handed out exactly as often as before (the queue's "waiting for
+///   their memory" count, its passes and the slots served do not move),
+///   and it never keeps a slot due that would have left the queue.
+/// - it uploads only when there is something to upload: a `dirty` staging
+///   buffer is bytes the card does not have (`dirty` is set by `detile`,
+///   and cleared only by the step of a list that recorded the copy). Once
+///   that copy is recorded the flag clears at submission, and the next look
+///   finds the slot clean and passes it over as before — on a texture that
+///   is not being written, the extra upload happens once.
+/// - what it costs is a couple of table lookups per *looked* slot — the
+///   slot's view (`descriptor::view`, and `texture_at` for a placed one)
+///   and the staging table — beside the 48 KiB `fingerprint` read the same
+///   look makes, and only for a slot in the recheck chain (a few thousand,
+///   one look each every 4 to 400 frames).
+/// It was on in the run above, so it is not measured alone: a run with
+/// `VICTORY_TEXTURE_RETRY_REFUSED` unset (the default) measures exactly it.
+pub(crate) fn texture_recheck_dirty() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RECHECK_DIRTY").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_TEXTURE_SLOW_LOOK`'s reading: the frames between the looks at
@@ -1560,6 +1634,13 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
+        // VICTORY_ABLATE=heap: the table of strides and the buffer for it are
+        // still kept and handed over; only the pass that makes every buffer
+        // view ready is skipped (the image is expected to break).
+        if crate::ablate::ablated(crate::ablate::HEAP) {
+            return Some(gpu);
+        }
+        let _pass = crate::trace::span("heap");
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
@@ -2003,7 +2084,24 @@ impl State {
             // the slot is done after them, as before.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                // With `VICTORY_TEXTURE_RECHECK_DIRTY` (on unless set to
+                // `0`): the card has what the look is about only if nothing
+                // was detiled into the staging buffer after the copy that
+                // carried the upload — an `upload` that found the staging
+                // buffer already there records no copy, and the refresh at
+                // that submission may then find what the title wrote after
+                // the list was recorded (`crate::texture::staged_dirty`).
+                // Such a slot is uploaded again now instead of being taken
+                // as it was. Off: the look asks nothing of the slot but its
+                // memory, as before (`3e1c3d4d`'s first version).
+                let clean = !texture_recheck_dirty()
+                    || heap
+                        .handle(index)
+                        .and_then(crate::descriptor::view)
+                        .as_ref()
+                        .and_then(texture_of)
+                        .is_none_or(|texture| !crate::texture::staged_dirty(texture));
+                if clean && crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2131,9 +2229,10 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
-            if let Some(view) = &view {
-                readable(list, sampled.kind, view);
-            }
+            let staged = match &view {
+                Some(view) => readable(list, sampled.kind, view),
+                None => true,
+            };
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -2145,6 +2244,29 @@ impl State {
                 crate::host::log_removal_context();
                 stop = 6;
                 break;
+            }
+            if texture_retry_refused() && !staged {
+                // The upload was refused: the card would not give the
+                // staging buffer (or the texture cannot be staged at all),
+                // and nothing of its memory was taken — the take is the
+                // detiling into the staging buffer, which there is none
+                // of. The slot is *not* marked uploaded, and what was known
+                // of an upload of it is dropped, or the pages a later pass
+                // took would wait for a look that never comes (Marvisak
+                // #3174). Measured on the 6 GB card, this is what the
+                // obligations did when they were kept: `texture_retry_refused`
+                // says why it is off. Looked at again in 1, 2, 4, ... frames,
+                // at most `most`.
+                let n = HEAP_TEXTURES_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(500) {
+                    tracing::info!(
+                        slot = index,
+                        so_far = n,
+                        "a texture picked by index could not be staged: looked at again, not taken as uploaded"
+                    );
+                }
+                host.texture_slot_refused(index, write, frame, most);
+                continue;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -3903,7 +4025,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3932,11 +4054,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let mut staged = true;
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                staged = crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -3962,6 +4085,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     );
                 }
             }
+            staged
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
@@ -3970,8 +4094,19 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
+            true
         }
-        _ => {}
+        _ => true,
+    }
+}
+
+/// The title texture a view of the heap shows: a texture object's, or the
+/// one a placed texture view lies in (`None` for a buffer view).
+fn texture_of(view: &View) -> Option<This> {
+    let placed = crate::descriptor::host::placed_texture(view);
+    match placed.as_ref().unwrap_or(view) {
+        View::Shader(resource, _) => Some(*resource as This),
+        _ => None,
     }
 }
 
