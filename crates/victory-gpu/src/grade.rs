@@ -8,15 +8,17 @@
 //! with the switch on and off says the place is right; any difference the
 //! curve shows afterwards is then the curve's.
 //!
-//! `VICTORY_GRADE=curve` records the same triangle with **one** curve and
-//! nothing else: a soft-knee compression of the highlights, per RGB
-//! channel, alpha untouched. Below `VICTORY_GRADE_KNEE` (0.75 by default) a
-//! channel is written as it is; above it the range left between the knee
-//! and white is bent toward white, continuously and monotonically, so the
-//! knee does not move and 1.0 still writes 1.0 ([`CURVE_SOURCE`] has the
-//! formula). The two knobs are read once ([`curve`]) and handed to the pixel
-//! program as **root constants**, so they change without a rebuild; the
-//! identity records no constant at all and keeps its own pipeline.
+//! `VICTORY_GRADE=curve` records the same triangle with **one** tone curve
+//! and a croma, per RGB channel, alpha untouched. Below `VICTORY_GRADE_KNEE`
+//! (0.75 by default) a channel is written as it is; above it the range left
+//! between the knee and `VICTORY_GRADE_WHITE` (1.0 by default) is bent,
+//! continuously and monotonically, so the knee does not move and 1.0 writes
+//! the white ([`CURVE_SOURCE`] has the formula). After the curve the croma
+//! is pulled toward the channel's luminance by `VICTORY_GRADE_SAT` (1.0 by
+//! default, the identity). The four knobs are read once ([`curve`]) and
+//! handed to the pixel program as **root constants**, so they change without
+//! a rebuild; the identity records no constant at all and keeps its own
+//! pipeline.
 //!
 //! Where it goes, from the dumps (`_port/victory/seriesS_up`):
 //!
@@ -159,22 +161,63 @@ const STRENGTH: f32 = 2.0;
 /// monotone over the whole range.
 const STRENGTH_RANGE: (f32, f32) = (0.0, 20.0);
 
-/// The two numbers the curve reads, as the pixel program sees them: `b0`.
+/// The value the white ends in (`VICTORY_GRADE_WHITE`): 1.0 writes the top
+/// of the range as white, which is the curve as it was before the knob.
+const WHITE: f32 = 1.0;
+
+/// The white is allowed here, both ends included. It is not a range on its
+/// own: it must stay **above the knee** ([`shoulder`]), or the shoulder would
+/// have nowhere to bend and the curve would no longer be monotone.
+const WHITE_RANGE: (f32, f32) = (0.5, 1.0);
+
+/// The croma `VICTORY_GRADE_SAT` defaults to: 1.0 is the identity, exactly.
+const SAT: f32 = 1.0;
+
+/// The saturation is allowed here, both ends included: 0.0 is grey.
+const SAT_RANGE: (f32, f32) = (0.0, 1.0);
+
+/// The four numbers the curve reads, as the pixel program sees them: `b0`,
+/// four dwords = 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Knobs {
     knee: f32,
     strength: f32,
+    white: f32,
+    sat: f32,
 }
 
 /// The curve's knobs, read **once** from the environment ([`knob`]) and
 /// then carried to the shader as root constants.
 fn curve() -> Knobs {
     static KNOBS: OnceLock<Knobs> = OnceLock::new();
-    *KNOBS.get_or_init(|| Knobs {
-        knee: knob("VICTORY_GRADE_KNEE", KNEE, KNEE_RANGE),
-        strength: knob("VICTORY_GRADE_STRENGTH", STRENGTH, STRENGTH_RANGE),
+    *KNOBS.get_or_init(|| {
+        let knee = knob("VICTORY_GRADE_KNEE", KNEE, KNEE_RANGE);
+        Knobs {
+            knee,
+            strength: knob("VICTORY_GRADE_STRENGTH", STRENGTH, STRENGTH_RANGE),
+            white: shoulder(knee, knob("VICTORY_GRADE_WHITE", WHITE, WHITE_RANGE)),
+            sat: knob("VICTORY_GRADE_SAT", SAT, SAT_RANGE),
+        }
     })
+}
+
+/// The white the curve is fed: `white` when it sits above `knee`, otherwise
+/// 1.0 with a warning. It is **not** a silent clamp: with `white <= knee` the
+/// shoulder `knee + (white - knee) g(t)` collapses or inverts — the curve is
+/// no longer monotone — so the whole knob falls back to the neutral 1.0 and
+/// the log says so.
+fn shoulder(knee: f32, white: f32) -> f32 {
+    if white <= knee {
+        tracing::warn!(
+            knee,
+            white,
+            "the grade's white is not above its knee, so the curve would not be monotone: white = 1.0 is used"
+        );
+        1.0
+    } else {
+        white
+    }
 }
 
 /// One knob: the variable's value when it parses into `range` (inclusive),
@@ -226,18 +269,27 @@ float4 ps(Out i) : SV_Target {
 }
 "#;
 
-/// The curve's program: the same triangle, one curve, alpha untouched.
+/// The curve's program: the same triangle, one tone curve and a croma,
+/// alpha untouched.
 ///
 /// Per channel, with `t = (c - knee) / (1 - knee)` and `s = strength`:
 /// `g(t) = t + s t^2 (1 - t) / (1 + s t)`, and the channel is written as
-/// `knee + (1 - knee) g(t)` above the knee, as it is below it. Then
-/// `g(0) = 0` (the knee does not move), `g(1) = 1` (white stays white) and
-/// `g'(0) = 1` (no crease at the knee); `s t^2 (1 - t)` is never negative,
-/// so for `s >= 0` the highlight bends toward white and never away, and
-/// `s = 0` is the identity. Nothing else is touched.
+/// `knee + (white - knee) g(t)` above the knee, as it is below it. Then
+/// `g(0) = 0` (the knee does not move), `g(1) = 1` (1.0 writes `white`) and
+/// `g'(0) = 1`; `s t^2 (1 - t)` is never negative, so for `s >= 0` the
+/// shoulder bends toward the white and never away, and `s = 0` is linear.
+/// With `white = 1.0` this is exactly the curve of before.
+///
+/// **After** the tone curve, the croma: `l = dot(rgb, luma)` and
+/// `rgb = lerp(rgb, l.xxx, 1 - sat)`. `lerp(a, b, 0.0)` returns `a`
+/// **exactly**, so `sat = 1.0` is the exact identity, not "almost"; and the
+/// luminance `l` is a convex combination of the three channels (the weights
+/// sum to one and are positive), so pulling each channel toward `l` can
+/// never overshoot the min/max of the three — the desaturation cannot create
+/// a new clip.
 const CURVE_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0))"
-cbuffer Knobs : register(b0) { float knee; float strength; };
+#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0))"
+cbuffer Knobs : register(b0) { float knee; float strength; float white; float sat; };
 Texture2D<float4> colour : register(t0);
 struct Out { float4 at : SV_Position; };
 // A triangle larger than the screen: three vertices, no buffer.
@@ -251,14 +303,19 @@ Out vs(uint id : SV_VertexID) {
 [RootSignature(RS)]
 float4 ps(Out i) : SV_Target {
     float4 c = colour.Load(int3(int2(i.at.xy), 0));
-    // Where the channel sits above the knee: 0 at the knee, 1 at white.
+    // Where the channel sits above the knee: 0 at the knee, 1 at 1.0.
     float3 t = saturate((c.rgb - knee) / (1.0 - knee));
-    // g(t): 0 at the knee, 1 at white, slope 1 at the knee, and for
+    // g(t): 0 at the knee, 1 at 1.0, slope 1 at the knee, and for
     // strength >= 0 bent toward white.
     float3 g = t + strength * t * t * (1.0 - t) / (1.0 + strength * t);
-    float3 bent = knee + (1.0 - knee) * g;
+    // The shoulder ends at `white` (and at `knee` it is still `knee`).
+    float3 bent = knee + (white - knee) * g;
     // Below the knee t is 0 and the texel is written as it is; alpha always.
     c.rgb = lerp(c.rgb, bent, step(knee, c.rgb));
+    // Then the croma: toward the luminance, by (1 - sat). sat = 1.0 is the
+    // exact identity; l is a convex combination, so this cannot clip anew.
+    float l = dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+    c.rgb = lerp(c.rgb, l.xxx, 1.0 - sat);
     return c;
 }
 "#;
@@ -612,6 +669,8 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
             view = pass.view.0,
             knee = pass.knobs.knee,
             strength = pass.knobs.strength,
+            white = pass.knobs.white,
+            sat = pass.knobs.sat,
             "the finished colour gets the highlight curve (VICTORY_GRADE=curve)"
         ),
     });
@@ -693,10 +752,16 @@ pub(crate) fn before_draw(list: &HostList, image: This, format: Option<u32>) -> 
                     pass.views.GetGPUDescriptorHandleForHeapStart(),
                 );
             }
-            // The curve: b0 (knee, strength) first, then the table.
+            // The curve: b0 (knee, strength, white, sat) first, then the
+            // table.
             Style::Curve => {
-                let knobs = [pass.knobs.knee, pass.knobs.strength];
-                l.SetGraphicsRoot32BitConstants(0, 2, knobs.as_ptr().cast(), 0);
+                let knobs = [
+                    pass.knobs.knee,
+                    pass.knobs.strength,
+                    pass.knobs.white,
+                    pass.knobs.sat,
+                ];
+                l.SetGraphicsRoot32BitConstants(0, 4, knobs.as_ptr().cast(), 0);
                 l.SetGraphicsRootDescriptorTable(
                     1,
                     pass.views.GetGPUDescriptorHandleForHeapStart(),
@@ -774,12 +839,23 @@ mod tests {
         }
     }
 
-    /// The shader's curve on one channel, mirrored here (in `f64`, for the
-    /// step near the knee) so it can be checked without a GPU:
-    /// `t = (c - knee) / (1 - knee)` and
-    /// `g = t + s t^2 (1 - t) / (1 + s t)`, written as `knee + (1 - knee) g`
-    /// above the knee and as `c` below it.
-    fn tone(c: f64, knee: f64, strength: f64) -> f64 {
+    /// The shader's tone curve on one channel, mirrored here (in `f64`, for
+    /// the step near the knee) so it can be checked without a GPU:
+    /// `t = saturate((c - knee) / (1 - knee))` and
+    /// `g = t + s t^2 (1 - t) / (1 + s t)`, written as
+    /// `knee + (white - knee) g` above the knee and as `c` below it.
+    fn tone(c: f64, knee: f64, strength: f64, white: f64) -> f64 {
+        if c <= knee {
+            return c;
+        }
+        let t = ((c - knee) / (1.0 - knee)).clamp(0.0, 1.0);
+        let g = t + strength * t * t * (1.0 - t) / (1.0 + strength * t);
+        knee + (white - knee) * g
+    }
+
+    /// The curve as it was before the white knob, `white = 1.0` made
+    /// literal: the reference `tone(.., 1.0)` must be equal to, bit for bit.
+    fn tone_before(c: f64, knee: f64, strength: f64) -> f64 {
         if c <= knee {
             return c;
         }
@@ -788,23 +864,53 @@ mod tests {
         knee + (1.0 - knee) * g
     }
 
-    /// The two identities the curve must keep: the knee does not move (from
-    /// either side) and white stays white; the slope at the knee is the
-    /// identity's; it never decreases, never leaves the picture, and never
-    /// darkens.
+    /// The shader's croma, mirrored: `l = dot(rgb, luma)` and
+    /// `rgb = lerp(rgb, l, 1 - sat)` per channel.
+    fn croma(rgb: [f64; 3], sat: f64) -> [f64; 3] {
+        let l = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        let w = 1.0 - sat;
+        [
+            rgb[0] + w * (l - rgb[0]),
+            rgb[1] + w * (l - rgb[1]),
+            rgb[2] + w * (l - rgb[2]),
+        ]
+    }
+
+    /// `white = 1.0` is exactly the curve of before: the same values, not
+    /// "close".
+    #[test]
+    fn white_one_is_the_curve_of_before() {
+        for knee in [0.3f64, 0.5, 0.75, 0.95] {
+            for strength in [0.0f64, 0.5, 2.0, 20.0] {
+                for i in 0..=1000 {
+                    let c = f64::from(i) / 1000.0;
+                    assert_eq!(
+                        tone(c, knee, strength, 1.0),
+                        tone_before(c, knee, strength),
+                        "c {c} knee {knee} strength {strength}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two identities the curve must keep, and the slope at the knee:
+    /// the knee does not move (from either side) and the top of the range is
+    /// white; the slope is the identity's at `white = 1.0`; the curve never
+    /// decreases, never leaves the picture, and never darkens.
     #[test]
     fn the_curve_keeps_the_knee_and_white_in_place() {
         for knee in [0.3f64, 0.5, 0.75, 0.95] {
             for strength in [0.0f64, 0.5, 2.0, 20.0] {
-                assert!((tone(knee, knee, strength) - knee).abs() < 1e-9);
+                assert!((tone(knee, knee, strength, 1.0) - knee).abs() < 1e-9);
                 let below = knee - 1e-4;
-                assert!((tone(below, knee, strength) - below).abs() < 1e-9);
-                assert!((tone(1.0, knee, strength) - 1.0).abs() < 1e-9);
+                assert!((tone(below, knee, strength, 1.0) - below).abs() < 1e-9);
+                assert!((tone(1.0, knee, strength, 1.0) - 1.0).abs() < 1e-9);
                 // Soft knee: `g'(0) = 1`, so the knee has no crease. The
                 // step is in `t`, which the knee's place cannot distort.
                 let t = 1e-7;
-                let slope =
-                    (tone(knee + t * (1.0 - knee), knee, strength) - knee) / (t * (1.0 - knee));
+                let slope = (tone(knee + t * (1.0 - knee), knee, strength, 1.0) - knee)
+                    / (t * (1.0 - knee));
                 assert!(
                     (slope - 1.0).abs() < 1e-4,
                     "knee {knee} strength {strength}: slope {slope}"
@@ -812,7 +918,7 @@ mod tests {
                 let mut last = 0.0f64;
                 for i in 0..=1000 {
                     let c = f64::from(i) / 1000.0;
-                    let out = tone(c, knee, strength);
+                    let out = tone(c, knee, strength, 1.0);
                     assert!(out >= last - 1e-9, "not monotone at {c} (knee {knee})");
                     assert!(out >= c - 1e-9, "darkened {c} (knee {knee})");
                     assert!(out <= 1.0 + 1e-9, "{out} above white (knee {knee})");
@@ -823,8 +929,98 @@ mod tests {
         // Strength 0 is the identity, everywhere.
         for i in 0..=1000 {
             let c = f64::from(i) / 1000.0;
-            assert!((tone(c, 0.75, 0.0) - c).abs() < 1e-12);
+            assert!((tone(c, 0.75, 0.0, 1.0) - c).abs() < 1e-12);
         }
+    }
+
+    /// `white < 1.0`: the top of the range lands exactly in `white`, the knee
+    /// is still continuous, and the curve stays monotone for every allowed
+    /// pair with `white > knee`.
+    #[test]
+    fn white_moves_the_top_and_the_curve_stays_monotone() {
+        for knee in [0.3f64, 0.5, 0.75, 0.9, 0.95] {
+            for white in [0.5f64, 0.6, 0.75, 0.9, 1.0] {
+                if white <= knee {
+                    continue;
+                }
+                for strength in [0.0f64, 0.5, 2.0, 20.0] {
+                    // Continuity at the knee, from both sides.
+                    assert!((tone(knee, knee, strength, white) - knee).abs() < 1e-9);
+                    let below = knee - 1e-6;
+                    assert!((tone(below, knee, strength, white) - below).abs() < 1e-9);
+                    // The top of the range is exactly the white.
+                    assert!(
+                        (tone(1.0, knee, strength, white) - white).abs() < 1e-9,
+                        "knee {knee} white {white} strength {strength}"
+                    );
+                    // Monotone, and never above the white.
+                    let mut last = 0.0f64;
+                    for i in 0..=2000 {
+                        let c = f64::from(i) / 2000.0;
+                        let out = tone(c, knee, strength, white);
+                        assert!(
+                            out >= last - 1e-9,
+                            "not monotone at {c} (knee {knee} white {white})"
+                        );
+                        assert!(out <= white + 1e-9, "{out} above white {white}");
+                        last = out;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sat = 1.0` is the **exact** identity (`==`, not "almost");
+    /// `sat = 0.0` makes the three channels the luminance, which is a convex
+    /// combination and so cannot create a new clip.
+    #[test]
+    fn the_croma_is_exact_at_one_and_grey_at_zero() {
+        let rgb = [0.13f64, 0.71, 0.44];
+        let same = croma(rgb, 1.0);
+        assert!(same[0] == rgb[0] && same[1] == rgb[1] && same[2] == rgb[2]);
+        let l = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        for channel in croma(rgb, 0.0) {
+            assert!((channel - l).abs() < 1e-12, "{channel} vs luminance {l}");
+        }
+        let low = rgb.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = rgb.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(l >= low - 1e-12 && l <= high + 1e-12);
+    }
+
+    /// The two new knobs are numbers inside their range and nothing else; the
+    /// defaults are 1.0, and a value outside the range is refused (the default
+    /// is used and `knob` warns, never a silent clamp).
+    #[test]
+    fn the_white_and_sat_knobs_are_numbers_inside_their_range() {
+        let white = super::WHITE_RANGE;
+        let sat = super::SAT_RANGE;
+        assert_eq!(super::WHITE, 1.0);
+        assert_eq!(super::SAT, 1.0);
+        // Accepted, both ends included, spaces trimmed.
+        assert_eq!(super::knob_of("0.5", white), Some(0.5));
+        assert_eq!(super::knob_of(" 1 ", white), Some(1.0));
+        assert_eq!(super::knob_of("0", sat), Some(0.0));
+        assert_eq!(super::knob_of("1.0", sat), Some(1.0));
+        // Out of range or not a number: no value (the default stands, warned).
+        for bad in ["", " ", "0.49", "1.01", "white", "inf", "NaN"] {
+            assert_eq!(super::knob_of(bad, white), None, "{bad:?} as a white");
+        }
+        for bad in ["", " ", "-0.01", "1.01", "sat", "inf", "NaN"] {
+            assert_eq!(super::knob_of(bad, sat), None, "{bad:?} as a sat");
+        }
+    }
+
+    /// A white at or below the knee is not used: the shoulder would collapse
+    /// or invert, so the knob falls back to 1.0 (with a warning), never a
+    /// silent clamp to the knee.
+    #[test]
+    fn a_white_at_or_below_the_knee_falls_back_to_one() {
+        assert_eq!(super::shoulder(0.75, 1.0), 1.0);
+        assert_eq!(super::shoulder(0.75, 0.8), 0.8);
+        assert_eq!(super::shoulder(0.75, 0.75), 1.0);
+        assert_eq!(super::shoulder(0.5, 0.5), 1.0);
+        assert_eq!(super::shoulder(0.95, 0.5), 1.0);
+        assert_eq!(super::shoulder(0.3, 0.5), 0.5);
     }
 
     /// The views name a concrete format: the image's own when it is one; the
