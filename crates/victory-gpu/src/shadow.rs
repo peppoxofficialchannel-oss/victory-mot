@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -71,6 +71,12 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// The title gave the buffer back ([`unregister`]) while this copy still
+    /// had a submission's copy-back pending: `data` is ours to read, but
+    /// `start` is no address of the title's any more, and whatever holds it
+    /// now is not this copy's. Nothing is written back through it
+    /// (FIND-14: a copy holds the address it was registered with).
+    gone: AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1853,7 +1859,8 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs};
+    use super::{PIECE, Shadow, back_piece, changed_runs};
+    use std::sync::Arc;
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2106,11 +2113,123 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+
+    /// The copy a test puts in the registry: the title's range is a plain
+    /// allocation of our own ([`VirtualAlloc`]), the copy's bytes a `Vec` the
+    /// test keeps alive. `None` without the software adapter to make the
+    /// `ID3D12Resource` a copy names (nothing else of it is used).
+    fn copy_of(title: *mut u8, len: usize, fill: u8) -> Option<(Arc<Shadow>, Vec<u8>)> {
+        let buffer = super::card_merge_tests::warp_buffer()?;
+        let mut data = vec![fill; len];
+        let shadow = Shadow::new(buffer, data.as_mut_ptr(), 0, title as u64, len as u64);
+        Some((Arc::new(shadow), data))
+    }
+
+    /// FIND-14 (upstream VIctory #3036): a copy-back still pending when the
+    /// title gives its range back, and takes the same addresses again for
+    /// something else, must not put the submission's bytes into the new use
+    /// of them. `crate::watch` documents that memory freed and allocated
+    /// again while a tracker holds it is not seen; nothing connected that
+    /// with a copy's pending snapshot, and a copy holds the address it was
+    /// registered with and writes back through it. No game and no card: the
+    /// title's range is a plain allocation the test frees and takes again.
+    #[test]
+    fn a_copy_back_pending_when_the_title_takes_the_range_back_writes_nothing() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const LEN: usize = PIECE;
+        const RESOURCE: usize = 0x51_5151;
+        let alloc = |fill: u8| {
+            // SAFETY: our own allocation, freed by the caller.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as *mut u8;
+            assert!(!p.is_null());
+            // SAFETY: the allocation above.
+            unsafe { std::ptr::write_bytes(p, fill, LEN) };
+            p
+        };
+
+        // Control, without the title taking the range back: the shader's
+        // byte does go into the title's memory while it is still the title's.
+        let p = alloc(0x11);
+        let Some((copy, mut data)) = copy_of(p, LEN, 0x11) else {
+            eprintln!("no software adapter for a copy's buffer; not observed");
+            // SAFETY: our own allocation, freed once.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        super::register_copy(RESOURCE, p as u64, LEN as u64, copy.clone());
+        // The submission takes its snapshot, and a shader writes one byte.
+        copy.writing(p as usize, LEN);
+        super::take_snapshots();
+        data[24] = 0x99;
+        assert_eq!(copy.copy_back(p as usize, LEN), 1, "the shader's byte went back");
+        copy.copy_back_done(&[(p as usize, p as usize + LEN)]);
+        // SAFETY: the allocation above, still ours.
+        assert_eq!(unsafe { *p.add(24) }, 0x99, "the GPU's byte reached title memory");
+        // The title releases the buffer, as `Resource::drop` has it.
+        super::unregister(RESOURCE, p as u64);
+        // SAFETY: our own allocation, freed once.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+
+        // The same submission, but the title gives the range back before the
+        // copy-back has run, and takes the addresses again for something of
+        // its own. The new use holds zeros where the snapshot holds zeros:
+        // the merge keeps the title's byte wherever the title moved it, so
+        // this is the case where a byte the shader wrote for a submission
+        // that is over would land in memory the title now uses (a fresh
+        // allocation of the same size is zeros almost everywhere).
+        let p = alloc(0x00);
+        let Some((copy, mut data)) = copy_of(p, LEN, 0x00) else {
+            // SAFETY: our own allocation, freed once.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        super::register_copy(RESOURCE, p as u64, LEN as u64, copy.clone());
+        copy.writing(p as usize, LEN);
+        super::take_snapshots();
+        data[24] = 0x99;
+        super::unregister(RESOURCE, p as u64);
+        // SAFETY: our own allocation, freed once.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: a fresh allocation of the same size, filled for the test.
+        let q = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert!(q != 0);
+        // SAFETY: the allocation above.
+        unsafe { std::ptr::write_bytes(q as *mut u8, 0x00, LEN) };
+        if q != p as usize {
+            // The allocator handed out somewhere else, so the old address is
+            // nobody's: writing there is the same hazard, but it cannot be
+            // observed without faulting, and this test is about the bytes.
+            // SAFETY: as above.
+            unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+            eprintln!("the allocator did not reuse the address ({:#x} then {q:#x}); not observed", p as usize);
+            return;
+        }
+        // The copy-back of the submission that is over runs now, and writes
+        // nothing: neither the shader's byte nor anything else.
+        assert_eq!(copy.copy_back(p as usize, LEN), 0, "a copy-back of a range the title took back wrote");
+        copy.copy_back_done(&[(p as usize, p as usize + LEN)]);
+        // SAFETY: the re-used allocation, still mapped.
+        let after = unsafe { (*p.add(24), *p.add(64), *p.add(LEN - 1)) };
+        // SAFETY: as above.
+        unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(
+            after,
+            (0x00, 0x00, 0x00),
+            "a byte a shader wrote for a submission that is over landed in memory the title re-used"
+        );
+    }
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Copy-backs not written because the title had taken the copy's range back
+/// ([`Shadow::gone`]), and the bytes of those copies: FIND-14, said on the
+/// first ones and then at powers of two.
+static GONE_BACKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Drop for Shadow {
     fn drop(&mut self) {
@@ -2504,6 +2623,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            gone: AtomicBool::new(false),
             place: None,
         }
     }
@@ -2647,6 +2767,29 @@ impl Shadow {
         }
     }
 
+    /// Whether what the copy holds is still the title's: false once the
+    /// title gave the range back ([`unregister`]), so a copy-back still
+    /// pending writes nothing through an address that is now something
+    /// else's (`FIND-14`). Counted ([`GONE_BACKS`]), and said on the first
+    /// ones and then at powers of two: a copy dropped this way is not a
+    /// lost write of the title's, it is a submission that was over.
+    fn still_ours(&self) -> bool {
+        if !self.gone.load(Ordering::Relaxed) {
+            return true;
+        }
+        let n = GONE_BACKS[0].fetch_add(1, Ordering::Relaxed) + 1;
+        GONE_BACKS[1].fetch_add(self.len, Ordering::Relaxed);
+        if n <= 8 || n.is_power_of_two() {
+            tracing::info!(
+                start = format_args!("{:#x}", self.start),
+                len = self.len,
+                n,
+                "a copy-back went unwritten: the title took the range its copy holds"
+            );
+        }
+        false
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote back
     /// into title memory (unmapped pages left alone), and only those: the
     /// title's threads write the same buffers while the GPU runs (its
@@ -2664,7 +2807,7 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
-        if self.place.is_some() {
+        if self.place.is_some() || !self.still_ours() {
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -2770,7 +2913,7 @@ impl Shadow {
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+        if self.card.is_some() || n == 0 || at + n > self.len as usize || !self.still_ours() {
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3455,7 +3598,7 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        if self.card.is_none() || at + gpu.len() > self.len as usize || !self.still_ours() {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
@@ -3524,7 +3667,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        if at + gpu.len() > self.len as usize || !self.still_ours() {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3619,7 +3762,28 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let entry = buffers().remove(&(start, resource));
+    // A copy-back still pending must not write through an address the title
+    // has taken back: whatever holds it now is not this copy's (FIND-14).
+    // The copy stays for the lists that still hold it (its own bytes are
+    // theirs to read), but nothing of it goes back to title memory.
+    if let Some(shadow) = entry.and_then(|e| e.shadow) {
+        shadow.gone.store(true, Ordering::Relaxed);
+    }
+}
+
+/// For the tests: a title buffer registered with its copy made already, as
+/// `lookup` leaves it, so that `unregister` finds it — without a host GPU to
+/// make one.
+#[cfg(test)]
+fn register_copy(resource: usize, start: u64, len: u64, shadow: Arc<Shadow>) {
+    buffers().insert(
+        (start, resource),
+        Entry {
+            end: start + len,
+            shadow: Some(shadow),
+        },
+    );
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4194,7 +4358,7 @@ mod card_merge_tests {
 
     /// A plain buffer on the software adapter: what a copy's `buffer` and
     /// its card's `staging` are; the merge never touches them.
-    fn warp_buffer() -> Option<ID3D12Resource> {
+    pub(super) fn warp_buffer() -> Option<ID3D12Resource> {
         // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
