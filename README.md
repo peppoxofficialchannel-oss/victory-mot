@@ -10,6 +10,53 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## What this branch adds
+
+Beyond the fork this one grows from, this branch carries three things.
+
+**A colour pass on the finished colour image.** A full-screen pass records just
+before the title's 8-bit encode — the last place that reads the whole colour —
+takes the image from the encode's own table, reads it through a copy and writes
+the title's image back. It shapes three things and nothing else: the black
+point, a soft-knee shoulder on the highlights with a settable white end, and a
+chroma scale. Every knob is read from the environment once, so values change
+without a rebuild.
+
+Measured on captured frames of one scripted scene (`R10G10B10A2_UNORM`,
+1920x1080, 150 to 178 frames per run):
+
+| | before | after |
+|---|---|---|
+| pixels below luma 8 | **33.45%** | **0.00%** |
+| 5th percentile of luma | 0.0 | 13.0 |
+| pixels at 254 or above, worst frame | **99.24%** (a title card) | **0.00% on every frame** |
+| distinct levels | 249 | 236 |
+
+The pass costs nothing measurable at equal draws: the fit `frame = intercept +
+slope * draws` gives a **255 ms** intercept with it against **267 ms** without,
+inside the method's own noise.
+
+**A crash reporter that names the function.** Every crash line now carries the
+`.pdata` function that holds the faulting instruction — `0x4faf7cb in
+0x4faf710-0x4faf844 (+0xbb) of the image` — instead of an offset inside a 120 MB
+image. It reads through `ReadProcessMemory` with checked arithmetic, so a
+half-corrupt image yields no function rather than a second fault.
+
+**Two fixes on the write watch and the copy-back, with tests.** A copy-back
+whose range the title has taken back writes nothing (`FIND-14`), and the write
+watch is told before a write rather than after it, with free memory no longer
+counted as a view.
+
+### Known issue
+
+In some scenes a run dies after four to ten minutes. A bisect, one build at a
+time with the same configuration, puts it on a guard added in this branch that
+held guarded blocks open across the copy-back: builds without it ran fifteen
+minutes clean three times, builds with it died in eight runs out of eight. The
+guard is reverted here. The write it was meant to cure has not been seen since.
+The trade is deliberate: a known fault is better than a silent corruption of the
+title's memory.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
