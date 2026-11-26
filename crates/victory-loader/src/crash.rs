@@ -484,6 +484,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         code as u32,
         locate(at)
     ));
+    // The function the faulting instruction is part of, which `at` alone
+    // does not say (the title's image has 299,257 of them).
+    line(format!("  {}", function_of(at)));
     line(format!(
         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
         context.Rax,
@@ -656,6 +659,11 @@ pub fn locate(address: usize) -> String {
 }
 
 fn module_of(address: usize) -> Option<String> {
+    module_at(address).map(|(module, name)| format!("{name}+{:#x}", address - module as usize))
+}
+
+/// The image `address` lies in: its handle and file name.
+fn module_at(address: usize) -> Option<(HMODULE, String)> {
     let mut module: HMODULE = std::ptr::null_mut();
     // SAFETY: looks up the module containing `address`; no reference taken.
     let found = unsafe {
@@ -673,7 +681,128 @@ fn module_of(address: usize) -> Option<String> {
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{:#x}", address - module as usize))
+    Some((module, name.to_owned()))
+}
+
+/// The `.pdata` function that contains `address`, with its module, as
+/// `0x4faf7cb in 0x4faf710-0x4faf844 (+0xbb) of title.exe`: the code the
+/// faulting instruction is part of, which its address alone does not name.
+/// Says so plainly when there is no such function (code the loader has no
+/// unwind data for, JIT and generated code for one).
+fn function_of(address: usize) -> String {
+    let Some((module, name)) = module_at(address) else {
+        return format!("{address:#x} is not in an image, so no .pdata function");
+    };
+    let rva = (address - module as usize) as u32;
+    match pdata_function_of(module as usize, rva) {
+        Some((begin, end)) => format!(
+            "0x{rva:x} in 0x{begin:x}-0x{end:x} (+0x{:x}) of {name}",
+            rva - begin
+        ),
+        None => format!("0x{rva:x} in {name}: no .pdata function"),
+    }
+}
+
+/// `RUNTIME_FUNCTION::BeginAddress` and `EndAddress` length in a `.pdata`
+/// table.
+const RUNTIME_FUNCTION_SIZE: usize = 12;
+
+/// The `(begin, end)` RVAs of the `.pdata` function that contains `rva` in
+/// the image loaded at `base`, or `None` if the image has no `.pdata` entry
+/// for it (a module without unwind data, JIT code).
+///
+/// Reads only through `ReadProcessMemory`, so a half-corrupt image in a
+/// crash handler gets `None` instead of a fault.
+pub(crate) fn pdata_function_of(base: usize, rva: u32) -> Option<(u32, u32)> {
+    let (table, size) = pdata(base)?;
+    let count = size / RUNTIME_FUNCTION_SIZE;
+    // The table is sorted by `BeginAddress`: binary search for the first
+    // entry that starts after `rva`.
+    let (mut low, mut high) = (0usize, count);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if runtime_function(table, mid)?.0 <= rva {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    // Entries may share a `BeginAddress` (chained unwind info): walk back
+    // over them, then stop at the first entry that starts earlier, whose
+    // function ends even earlier.
+    while low > 0 {
+        low -= 1;
+        let (begin, end) = runtime_function(table, low)?;
+        // A chained entry has the low bit of `BeginAddress` set and no
+        // `EndAddress` of its own.
+        if begin & 1 == 0 && begin <= rva && rva < end {
+            return Some((begin, end));
+        }
+        if begin < rva {
+            break;
+        }
+    }
+    None
+}
+
+/// The `.pdata` table of the image at `base`: its address and byte size, or
+/// `None` if `base` is no PE image or its exception directory is empty.
+fn pdata(base: usize) -> Option<(usize, usize)> {
+    let mut dos = [0u8; 0x40];
+    // `IMAGE_DOS_HEADER::e_magic` and `e_lfanew`.
+    if !read_quietly(base, &mut dos) || le16(&dos[0..2]) != 0x5a4d {
+        return None; // no `MZ`
+    }
+    let nt = base.checked_add(le32(&dos[0x3c..0x40]) as usize)?;
+    let mut headers = [0u8; 0x18]; // `Signature` and `IMAGE_FILE_HEADER`
+    if !read_quietly(nt, &mut headers) || le32(&headers[0..4]) != 0x4550 {
+        return None; // no `PE\0\0`
+    }
+    let optional = nt + 0x18;
+    let mut magic = [0u8; 2];
+    if !read_quietly(optional, &mut magic) {
+        return None;
+    }
+    // `IMAGE_OPTIONAL_HEADER` bytes before its data directories, and where
+    // `NumberOfRvaAndSizes` sits.
+    let (directories, sizes_at) = match le16(&magic) {
+        0x20b => (optional + 112, optional + 108), // PE32+
+        0x10b => (optional + 96, optional + 92),   // PE32
+        _ => return None,
+    };
+    let mut count = [0u8; 4];
+    if !read_quietly(sizes_at, &mut count) || le32(&count) < 4 {
+        return None; // no exception directory
+    }
+    let mut entry = [0u8; 8];
+    // Data directory 3: the exception table.
+    if !read_quietly(directories + 3 * 8, &mut entry) {
+        return None;
+    }
+    let (rva, size) = (le32(&entry[0..4]) as usize, le32(&entry[4..8]) as usize);
+    if rva == 0 || size < RUNTIME_FUNCTION_SIZE {
+        return None;
+    }
+    Some((base.checked_add(rva)?, size))
+}
+
+fn le16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().unwrap_or_default())
+}
+
+fn le32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().unwrap_or_default())
+}
+
+/// `BeginAddress` and `EndAddress` of `RUNTIME_FUNCTION` `i` in a `.pdata`
+/// table; `None` if those bytes cannot be read.
+fn runtime_function(table: usize, i: usize) -> Option<(u32, u32)> {
+    let mut entry = [0u8; RUNTIME_FUNCTION_SIZE];
+    let at = table.checked_add(i.checked_mul(RUNTIME_FUNCTION_SIZE)?)?;
+    if !read_quietly(at, &mut entry) {
+        return None;
+    }
+    Some((le32(&entry[0..4]), le32(&entry[4..8])))
 }
 
 /// What kind of memory `at` lies in: its region's allocation base, size
@@ -701,7 +830,6 @@ fn region_of(at: usize) -> String {
 
 /// Reads `out.len()` bytes at `at` without faulting; false if a page of the
 /// range cannot be read.
-#[cfg(feature = "diagnostics")]
 fn read_quietly(at: usize, out: &mut [u8]) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1090,5 +1218,51 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn pdata_function_of_finds_the_function_that_holds_an_rva() {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // kernel32.dll is always loaded and always has `.pdata`.
+        let name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        // SAFETY: a plain query of a loaded module.
+        let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+        assert!(!module.is_null(), "kernel32.dll not loaded");
+        let base = module as usize;
+        let (table, size) = pdata(base).expect("kernel32 has .pdata");
+        let count = size / RUNTIME_FUNCTION_SIZE;
+        assert!(count > 1000, "{count} entries");
+        for i in [0, count / 2, count - 1] {
+            let (begin, end) = runtime_function(table, i).expect("entry");
+            if begin & 1 != 0 || end <= begin {
+                continue; // chained unwind info: no extent of its own
+            }
+            let (found, found_end) =
+                pdata_function_of(base, begin).expect("the function starting here");
+            assert!(found <= begin && begin < found_end, "{begin:#x} in {found:#x}-{found_end:#x}");
+            // An RVA inside it lands in a function too, and names the module.
+            let middle = begin + (end - begin) / 2;
+            let (inner, inner_end) = pdata_function_of(base, middle).expect("inside a function");
+            assert!(inner <= middle && middle < inner_end);
+            let line = function_of(base + middle as usize);
+            assert!(line.to_lowercase().ends_with(" of kernel32.dll"), "{line}");
+            // Shown by `cargo test -- --nocapture`, to see the real format.
+            eprintln!("pdata: {line}");
+        }
+        // The headers are no function.
+        assert!(pdata_function_of(base, 0).is_none());
+        // Memory that is no image at all has no `.pdata`: nothing, not a crash.
+        // SAFETY: one fresh page of ours; only `ReadProcessMemory` reads it.
+        let scratch = unsafe {
+            VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        };
+        assert!(!scratch.is_null());
+        assert!(pdata_function_of(scratch as usize, 0).is_none());
+        assert!(!function_of(scratch as usize).contains(" in 0x"));
+        // SAFETY: releases the page made above.
+        unsafe { VirtualFree(scratch, 0, MEM_RELEASE) };
     }
 }
