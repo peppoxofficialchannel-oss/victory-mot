@@ -181,6 +181,7 @@ pub(super) fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1522,6 +1523,7 @@ fn wave_prefix_f32_uses_signed_flag_and_validates() {
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: l.half_views,
     };
     #[cfg(windows)]
     {
@@ -1691,6 +1693,7 @@ fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: l.half_views,
     }
 }
 
@@ -2042,6 +2045,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

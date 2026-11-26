@@ -106,7 +106,16 @@ impl<'a> Lower<'a> {
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        // (Unsigned integers where the access moves halves,
+                        // `VICTORY_HALVES=1`.)
+                        let halves = self
+                            .table_place(&Source::Loaded { load: site, first })
+                            .is_some_and(|p| {
+                                self.halves_only.contains(&p)
+                                    && (un.contains("_format_d16_")
+                                        || self.format_load_read_as_halves(ui))
+                            });
+                        (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {
                         (12 | u, stride)

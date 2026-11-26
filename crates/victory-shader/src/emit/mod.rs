@@ -368,6 +368,22 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// The table descriptors (root parameter, dword offset) the shader
+    /// moves sixteen bits a channel through (`buffer_load_format_d16_*`,
+    /// `buffer_store_format_d16_*`, and format loads whose result is read
+    /// only as halves), in order (`VICTORY_HALVES=1`). On the console each
+    /// channel's 16 bits move as they are through a 16-bit float view and
+    /// through a 16-bit integer one alike (the title keeps half floats,
+    /// and indices beside them, in `R16G16B16A16_UINT` and `R16_UINT`
+    /// buffers). The DXIL moves them as unsigned integers, which an
+    /// unsigned 16-bit view carries unchanged; the host shows the shader a
+    /// 16-bit float or signed buffer view at these places as the unsigned
+    /// format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -1102,6 +1118,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     forms::note(&shader.dxil, l.form);
     Ok((shader, wave_size))
@@ -1518,6 +1535,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1530,6 +1548,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1822,6 +1841,7 @@ mod tests {
                 root_srvs: l.root_srvs.clone(),
                 root_uavs: l.root_uavs.clone(),
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views.clone(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
