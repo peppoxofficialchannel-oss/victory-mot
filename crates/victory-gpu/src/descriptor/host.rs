@@ -1983,8 +1983,49 @@ impl HostHeap {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
+            // Not a view of ours. Three cases the log must tell apart, because
+            // two of them are ours to fix and one is the title's:
+            //   a slot still holding a view (made != 0) whose record names one
+            //   we no longer have: the resource was **released under the
+            //   title**, and its descriptors read null from here on;
+            //   a slot whose record is not ours at all: never written by the
+            //   title (its own null), which is the only one that is not a
+            //   defect of this layer.
+            // The colour pass is the reason this matters: its grade is baked
+            // from textures held in such slots, and a blind bake is applied
+            // as a grade (frames 3505 and 3583 of `seriesS_up`).
+            {
+                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                static RELEASED: AtomicU64 = AtomicU64::new(0);
+                static NEVER: AtomicU64 = AtomicU64::new(0);
+                static SAID: std::sync::Once = std::sync::Once::new();
+                if tag == VIEW_TAG {
+                    let n = RELEASED.fetch_add(1, Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(
+                            slot = index,
+                            handle = i,
+                            generation,
+                            for_draw,
+                            "a descriptor names a view this host no longer has: the resource was released under the title ({n} such slots since the start)"
+                        );
+                    }
+                } else {
+                    let n = NEVER.fetch_add(1, Relaxed) + 1;
+                    SAID.call_once(|| {
+                        tracing::info!(
+                            slot = index,
+                            "a descriptor holds no view at all (the title's own null); counted from here on"
+                        );
+                    });
+                    if n.is_power_of_two() {
+                        tracing::info!(
+                            slot = index, for_draw,
+                            "a draw reads a descriptor slot the title never filled ({n} lookups since the start)"
+                        );
+                    }
+                }
+            }
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
