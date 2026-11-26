@@ -52,8 +52,7 @@ mod float64;
 /// them, a child module so it shares the emitter's state.
 #[path = "guarded.rs"]
 mod guarded;
-/// Typed buffer loads whose result the program reads only as 16-bit halves (`VICTORY_HALVES=1`,
-/// off by default), a child module so it shares the emitter's state.
+/// Typed buffer loads whose result the program reads only as 16-bit halves (`VICTORY_HALVES=0` turns it off), a child module so it shares the emitter's state.
 #[path = "halves.rs"]
 mod halves;
 /// A geometry program's LDS rings as its inputs and outputs, a child module so it shares the
@@ -828,12 +827,13 @@ fn built_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BUILT_BOUNDS").is_none_or(|v| v != "0"))
 }
 
-/// `VICTORY_HALVES=1`: typed buffer loads whose result the program reads only as 16-bit halves
+/// `VICTORY_HALVES=0`: typed buffer loads whose result the program reads only as 16-bit halves
 /// move them as integers, and the host shows that descriptor a 16-bit unsigned view
-/// ([`Lower::places_read_as_halves`], [`super::HostShader::half_views`]). Off by default.
+/// ([`Lower::places_read_as_halves`], [`super::HostShader::half_views`]). On by default: without
+/// it the characters' faces stay frozen (five consecutive frames, 27/11), and with it they move.
 fn halves() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HALVES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALVES").is_none_or(|v| v != "0"))
 }
 
 /// The refusal of a first half of an interpolation whose result is read
