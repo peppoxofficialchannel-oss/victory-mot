@@ -27,7 +27,11 @@
 //! `ALLOW_UNORDERED_ACCESS`, so it has no unordered access view
 //! (`descriptor::host::fits` refuses one). The pass therefore copies it into
 //! a 1x1 image of its own that shaders can write, scales it there, and copies
-//! it back — two 16-byte copies and one thread, once per exposure draw.
+//! it back — two 16-byte copies and one thread, once per exposure draw. The
+//! draw leaves the image bound as a render target, and D3D12 copies neither
+//! from nor into a resource bound as one: the pass unbinds the targets first
+//! (`OMSetRenderTargets(0, None, false, None)`), and `crate::draw` binds them
+//! again as soon as the pass returns.
 //!
 //! Off by default (and with `VICTORY_EXPOSURE_SCALE=1`): the title's own
 //! exposure stays. Without the factor the pass records nothing at all.
@@ -497,6 +501,14 @@ pub(crate) fn after_draw(list: &HostList, target: This) -> bool {
             }
         }
     }
+    // The draw bound the exposure as a render target (`crate::draw`'s
+    // `set_targets`, which replays the title's `OMSetRenderTargets`: the 1x1
+    // image, and the depth-stencil view if the title had one). D3D12 does not
+    // copy a resource bound as one, in either direction, so the targets are
+    // let go before the copies; `crate::draw` sets them again when this
+    // returns, so the title's next draw finds them where it left them.
+    // SAFETY: an open list, and no view outlives the call.
+    unsafe { l.OMSetRenderTargets(0, None, false, None) };
     // The target the draw just wrote, put where the copy reads it.
     crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
     // SAFETY: an open list and live resources; our image is common at the

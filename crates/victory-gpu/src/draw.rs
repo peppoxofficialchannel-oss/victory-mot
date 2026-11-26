@@ -3135,11 +3135,11 @@ impl State {
             dropped(self.pipeline);
         }
         if ran && self.exposure(list) {
-            // The pass bound its own heap, root signature and pipeline:
-            // the next draw or dispatch binds the title's again.
-            self.host_pipeline = 0;
-            self.host_roots = [0; 2];
-            self.host_heaps = [0; 2];
+            // The pass unbound the render targets to copy the exposure: set
+            // them again. It also bound its own heap, root signature and
+            // pipeline, which `replay` clears along with them, so the next
+            // draw or dispatch binds the title's again.
+            self.replay(list);
         }
     }
 
