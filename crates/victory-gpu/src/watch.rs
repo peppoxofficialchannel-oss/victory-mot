@@ -26,6 +26,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::cold_skip::Written;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -79,8 +81,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    /// Page number → the asking that last found it written, and with
+    /// `VICTORY_COLD_SKIP` the marks of its chunks (`crate::cold_skip`).
+    written: Written,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -100,7 +103,7 @@ struct Journal {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Written::new(),
     parts: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
@@ -507,6 +510,26 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_lit(start, end, guarded, None)
+}
+
+/// [`writes`], with the marks of the range's chunks put into `marks`, read
+/// under the same lock as the pages (`VICTORY_COLD_SKIP`, `crate::cold_skip`).
+pub(crate) fn writes_marked(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: &mut Vec<(usize, u64)>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_lit(start, end, guarded, Some(marks))
+}
+
+fn writes_lit(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -514,13 +537,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.written.noted(first, last, marks)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -588,13 +605,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in guarded {
         j.note(page, WHOLE, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, j.written.noted(first, last, marks)))
 }
 
 impl Tracked {
@@ -2218,7 +2229,7 @@ mod tests {
     fn forget(start: usize, end: usize) {
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
         for page in start / PAGE..end.div_ceil(PAGE) {
-            j.written.remove(&page);
+            j.written.forget(page);
             j.parts.remove(&page);
         }
     }
