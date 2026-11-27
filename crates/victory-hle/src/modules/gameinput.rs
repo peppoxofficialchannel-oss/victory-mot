@@ -1134,6 +1134,10 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            #[cfg(feature = "diagnostics")]
+            if scripted_only() {
+                return None;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1166,7 +1170,11 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            #[cfg(feature = "diagnostics")]
+            let allow_host_keys = !scripted_only();
+            #[cfg(not(feature = "diagnostics"))]
+            let allow_host_keys = true;
+            if allow_host_keys && focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1196,6 +1204,31 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// Keep the scripted keyboard as the only GameInput source for a benchmark.
+    #[cfg(feature = "diagnostics")]
+    fn scripted_only() -> bool {
+        static ONLY: LazyLock<bool> = LazyLock::new(|| {
+            parse_scripted_only(std::env::var_os("VICTORY_KEYS_ONLY").as_deref())
+        });
+        *ONLY
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn parse_scripted_only(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|v| v == "1")
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn scripted_only_requires_explicit_one() {
+        use std::ffi::OsStr;
+        assert!(!parse_scripted_only(None));
+        for off in ["", "0", "true", "alt"] {
+            assert!(!parse_scripted_only(Some(OsStr::new(off))));
+        }
+        assert!(parse_scripted_only(Some(OsStr::new("1"))));
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
